@@ -40,6 +40,28 @@ public class Plugin : BaseUnityPlugin
     private static readonly int poolSize = 3000; 
     private static bool isVisualizationRunning = false;
 
+    private static readonly int MainYield = 7100;   // 35,281 positions / 5  frames = ~7,056.2
+    private static readonly int PlaceYield = 2500;  // 35,281 positions / 15 frames = ~2,352.1
+
+    /*
+     * Yield thresholds for coroutine execution to prevent frame drops.
+     *
+     * MainYield is used during the preprocessing phase:
+     * - Iterates through the 3D grid and separates positions into [visiblePositions] and [nonVisiblePositions].
+     * - Sorts both lists by distance to the camera.
+     * - This is a lightweight operation and should complete within 5 frames.
+     *
+     * PlaceYield is used during the ball placement phase:
+     * - Processes each position by calling CheckAndPlaceBallAt.
+     * - Prioritizes [visiblePositions] first, then [nonVisiblePositions].
+     * - This is a heavier operation, as it involves a RaycastHit for each of the 35,281 positions.
+     *
+     * The yield values are chosen to balance performance and responsiveness:
+     * - A higher yield value allows more work per frame but increases the risk of frame drops.
+     * - At 120 FPS, the current setting results in less than 5 FPS drop, which is negligible.
+     * - In laggy scenarios (e.g., 20 FPS), the coroutine should still complete in under 2 seconds without noticeable impact.
+     */
+
     private void Awake()
     {
         Logger = base.Logger;
@@ -339,6 +361,8 @@ public class Plugin : BaseUnityPlugin
                         mainCamera.transform.position.z + z
                     );
 
+                    // Uses WorldToViewportPoint() to check if each position is within the camera's view frustum (viewport coordinates 0-1 and z > 0)
+
                     Vector3 viewportPoint = theCamera.WorldToViewportPoint(position);
                     bool isVisible =
                         viewportPoint.x >= 0 && viewportPoint.x <= 1 &&
@@ -354,34 +378,44 @@ public class Plugin : BaseUnityPlugin
                         nonVisiblePositions.Add(position);
                     }
 
-                    if (totalCalls++ % 2000 == 0)
+                    if (totalCalls++ % MainYield == 0)
                         yield return null;
                 }
             }
         }
 
-        yield return StartCoroutine(SortWithYield(visiblePositions, theCamera.transform.position));
-        yield return StartCoroutine(SortWithYield(nonVisiblePositions, theCamera.transform.position));
+        // Calls SortWithYield() on both lists to sort by distance to camera for optimization)
+        yield return StartCoroutine(SortWithYield(visiblePositions, theCamera.transform.position, MainYield));
+        yield return StartCoroutine(SortWithYield(nonVisiblePositions, theCamera.transform.position, MainYield));
+
+        totalCalls = 0;
+
+        // Calls CheckAndPlaceBallAt() for each position, starting with visible ones
 
         // Second pass: Process visible positions first
         foreach (Vector3 pos in visiblePositions)
         {
+            if (pool_balls.Count <= 0)
+                break;
             CheckAndPlaceBallAt(pos);
-            if (totalCalls++ % 500 == 0)
+            if (totalCalls++ % PlaceYield == 0)
                 yield return null;
         }
 
         // Third pass: Process non-visible positions
         foreach (Vector3 pos in nonVisiblePositions)
         {
+            if (pool_redBalls.Count <= 0)
+                break;
             CheckAndPlaceBallAt(pos);
-            if (totalCalls++ % 500 == 0)
+            if (totalCalls++ % PlaceYield == 0)
                 yield return null;
         }
+
         isVisualizationRunning = false;
     }
 
-    IEnumerator SortWithYield(List<Vector3> list, Vector3 cameraPosition, int chunkSize = 2000)
+    IEnumerator SortWithYield(List<Vector3> list, Vector3 cameraPosition, int chunkSize)
     {
         int n = list.Count;
         int totalIterations = 0;
@@ -408,7 +442,7 @@ public class Plugin : BaseUnityPlugin
                 list[i + j] = chunk[j];
                 totalIterations++;
 
-                if (totalIterations % 2000 == 0)
+                if (totalIterations % MainYield == 0)
                 {
                     yield return null;
                 }
