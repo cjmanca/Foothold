@@ -95,19 +95,19 @@ public class Plugin : BaseUnityPlugin
         configStandableBallColor = Config.Bind("General", "Standable ground Color", StandableColor.White, "Change the ball color of standable ground.");
         configNonStandableBallColor = Config.Bind("General", "Non-standable ground Color", NonStandableColor.Red, "Change the ball color of non-standable ground.");
 
-        configRange = Config.Bind("General", "Detection Range", 10f, "How far from the camera the balls are placed. Increasing will heavily affect performance.");
+        configRange = Config.Bind("General", "Detection Range", 10f, new ConfigDescription("How far from the camera the balls are placed. Increasing will heavily affect performance.", new AcceptableValueRange<float>(5f, 28f)));
 
-        configXZFreq = Config.Bind("General", "Horizontal grid spacing", 0.5f, "How far apart the balls are placed horizontally. Reducing will heavily affect performance.");
+        configXZFreq = Config.Bind("General", "Horizontal grid spacing", 0.5f, new ConfigDescription("How far apart the balls are placed horizontally. Reducing will heavily affect performance.", new AcceptableValueRange<float>(0.1f, 2f)));
 
-        configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 100, "The maximum number of points to place per frame. Higher values increase performance impact but make the visualization appear faster.");
+        configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 100, new ConfigDescription("The maximum number of points to place per frame. Higher values reduce fps but make the visualization appear faster.", new AcceptableValueRange<int>(10, 20000)));
 
         configActivationKey = Config.Bind("General", "Activation Key", KeyCode.F);
 
-        configMode = Config.Bind("General", "Activation Mode", Mode.FadeAway, """
+        configMode = Config.Bind("General", "Activation Mode", Mode.Continuous, """
             Toggle: Press once to activate; press again to hide the indicator.
             Fade Away: Activates every time the button is pressed. The indicator will fade away after 3 seconds. Credit to VicVoss on GitHub for the idea.
             Trigger: Activates every time the button is pressed. The indicator will remain visible.
-            Continuous: Always active. The indicator will remain visible, and updates as you move.
+            Continuous: Always active. The indicator will remain visible, and updates as you move. Implemented by cjmanca on GitHub.
             """);
         configDebugMode = Config.Bind("General", "Debug Mode", false, "Show debug information");
 
@@ -576,7 +576,10 @@ public class Plugin : BaseUnityPlugin
         totalCalls = 0;
         
 
+        var (minX, maxX, minZ, maxZ) = cameraFrustum.GetFrequencyQuantizedXZFrustumBounds(freq);
+
         Rect oldArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange, nearestGridToCamera.z - safeRange, nearestGridToCamera.x + safeRange, nearestGridToCamera.z + safeRange);
+        Rect oldRecheckArea = Rect.MinMaxRect(minX, minZ, maxX, maxZ);
 
         cameraFrustum = new FastFrustum(mainCamera, range);
 
@@ -607,8 +610,10 @@ public class Plugin : BaseUnityPlugin
         }
 
 
-        var (minX, maxX, minZ, maxZ) = cameraFrustum.GetFrequencyQuantizedXZFrustumBounds(freq);
+        (minX, maxX, minZ, maxZ) = cameraFrustum.GetFrequencyQuantizedXZFrustumBounds(freq);
         Rect recheckArea = Rect.MinMaxRect(minX, minZ, maxX, maxZ);
+
+        var expiredRecheckAreas = SubtractRect(oldRecheckArea, recheckArea);
 
         foreach (var area in newAreas)
         {
@@ -680,6 +685,35 @@ public class Plugin : BaseUnityPlugin
         }
 
 
+        foreach (var area in expiredRecheckAreas)
+        {
+
+            int axMax = (int)Mathf.Round(area.xMax);
+            int ayMax = (int)Mathf.Round(area.yMax);
+
+            for (int x = (int)Mathf.Round(area.xMin); x <= axMax; x += safeFreq)
+            {
+                for (int z = (int)Mathf.Round(area.yMin); z <= ayMax; z += safeFreq)
+                {
+                    try
+                    {
+                        RemoveBallsInVerticalRay(x, z, false);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
+
+                    if (totalCalls >= maximumRaysPerFrame)
+                    {
+                        totalCalls = 0;
+                        yield return null;
+                    }
+                }
+            }
+        }
+
+
         {
             Rect area = recheckArea;
 
@@ -707,6 +741,7 @@ public class Plugin : BaseUnityPlugin
                 }
             }
         }
+
 
         isVisualizationRunning = false;
     }
@@ -875,12 +910,26 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private void RemoveBallsInVerticalRay(int xIndex, int zIndex)
+    private void RemoveBallsInVerticalRay(int xIndex, int zIndex, bool expireCache = true)
     {
         if (positionCache.TryGetValue((xIndex, zIndex), out var yDict))
         {
-            positionCache.Remove((xIndex, zIndex)); // clear cache for this vertical line. Consider keeping it for a certain larger radius?
-            yDict.ReturnToPool();
+            if (expireCache)
+            {
+                positionCache.Remove((xIndex, zIndex)); // clear cache for this vertical line. Consider keeping it for a certain larger radius?
+                yDict.ReturnToPool();
+            }
+            else
+            {
+                foreach (var kvp in yDict.list)
+                {
+                    PositionKey cachedKey = kvp.Value;
+                    if (cachedKey != null)
+                    {
+                        ReturnBallToPool(cachedKey);
+                    }
+                }
+            }
         }
     }
 
