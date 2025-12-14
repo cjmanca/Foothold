@@ -1,10 +1,12 @@
 ﻿using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using JetBrains.Annotations;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography.X509Certificates;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
@@ -17,13 +19,18 @@ public class Plugin : BaseUnityPlugin
     internal static new ManualLogSource Logger;
 
     internal static Scene currentScene;
-    internal static MainCamera mainCamera;
+    internal static Camera mainCamera;
+    internal static Vector3 focalReferencePoint;
+    internal static FastFrustum cameraFrustum;
     internal static bool activated = false;
     internal static Material baseMaterial;
     internal static float alpha = 1;
 
-    private static readonly Queue<GameObject> balls = [];
-    private static readonly Queue<GameObject> redBalls = [];
+
+    private static readonly Dictionary<(int, int), PositionYList> positionCache = new();
+    
+    private static readonly RaycastHit[] _terrainHitBuffer = new RaycastHit[1000];
+
     private static readonly Queue<GameObject> pool_balls = [];
     private static readonly Queue<GameObject> pool_redBalls = [];
     private static float lastScanTime = 0; // should only be needed when fade away is on
@@ -34,14 +41,33 @@ public class Plugin : BaseUnityPlugin
     private ConfigEntry<Mode> configMode;
     private ConfigEntry<StandableColor> configStandableBallColor;
     private ConfigEntry<NonStandableColor> configNonStandableBallColor;
+    private ConfigEntry<float> configRange;
+
+    private ConfigEntry<float> configXZFreq;
+    private ConfigEntry<int> configMaximumPointsPerFrame;
+
+    private static SafeXZ nearestGridToCamera; // nearest grid point to camera position, updated each frame
+    // This allows caching of grid positions instead of recalculating each time
+
+    private static float freq;
+    private static int safeFreq;
+    private static float range;
+    private static int safeRange;
+    private static int maximumRaysPerFrame;
+
+
+
     private Color LastStandableColor = Color.white;
     private Color LastNonStandableColor = Color.red;
 
-    private static readonly int poolSize = 3000; 
+    private static int poolSize = 3000; 
     private static bool isVisualizationRunning = false;
-
-    private static readonly int MainYield = 7100;   // 35,281 positions / 5  frames = ~7,056.2
-    private static readonly int PlaceYield = 2500;  // 35,281 positions / 15 frames = ~2,352.1
+    
+    private static string additionalDebugInfo = "";
+    
+    Color standable;
+    Color NonStandable;
+    static int totalCalls = 0;
 
     /*
      * Yield thresholds for coroutine execution to prevent frame drops.
@@ -69,12 +95,19 @@ public class Plugin : BaseUnityPlugin
         configStandableBallColor = Config.Bind("General", "Standable ground Color", StandableColor.White, "Change the ball color of standable ground.");
         configNonStandableBallColor = Config.Bind("General", "Non-standable ground Color", NonStandableColor.Red, "Change the ball color of non-standable ground.");
 
+        configRange = Config.Bind("General", "Detection Range", 10f, "How far from the camera the balls are placed. Increasing will heavily affect performance.");
+
+        configXZFreq = Config.Bind("General", "Horizontal grid spacing", 0.5f, "How far apart the balls are placed horizontally. Reducing will heavily affect performance.");
+
+        configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 100, "The maximum number of points to place per frame. Higher values increase performance impact but make the visualization appear faster.");
+
         configActivationKey = Config.Bind("General", "Activation Key", KeyCode.F);
 
         configMode = Config.Bind("General", "Activation Mode", Mode.FadeAway, """
             Toggle: Press once to activate; press again to hide the indicator.
             Fade Away: Activates every time the button is pressed. The indicator will fade away after 3 seconds. Credit to VicVoss on GitHub for the idea.
             Trigger: Activates every time the button is pressed. The indicator will remain visible.
+            Continuous: Always active. The indicator will remain visible, and updates as you move.
             """);
         configDebugMode = Config.Bind("General", "Debug Mode", false, "Show debug information");
 
@@ -100,21 +133,33 @@ public class Plugin : BaseUnityPlugin
         configNonStandableBallColor.SettingChanged += Color_SettingChanged;
         configMode.SettingChanged += ConfigMode_SettingChanged;
 
+        configRange.SettingChanged += Color_SettingChanged;
+        configXZFreq.SettingChanged += Color_SettingChanged;
+        configMaximumPointsPerFrame.SettingChanged += Color_SettingChanged;
+
+
+
         Logger.LogInfo($"Loaded Foothold? version {MyPluginInfo.PLUGIN_VERSION}");
     }
 
     private void ConfigMode_SettingChanged(object sender, EventArgs e)
     {
-        ReturnBallsToPool();
+        ReturnAllBallsToPool();
 
         if (configMode.Value != Mode.FadeAway)
         {
-            foreach (GameObject ball in balls.Concat(redBalls))
+            foreach (var pkc in positionCache.Values)
             {
-                Material mat = ball.GetComponent<Renderer>().material;
-                Color baseColor = mat.GetColor("_BaseColor");
-                baseColor.a = alpha;
-                mat.SetColor("_BaseColor", baseColor);
+                foreach (var ball in pkc.list.Values)
+                {
+                    if (ball != null)
+                    {
+                        Material mat = ball.ballObject.GetComponent<Renderer>().material;
+                        Color baseColor = mat.GetColor("_BaseColor");
+                        baseColor.a = alpha;
+                        mat.SetColor("_BaseColor", baseColor);
+                    }
+                }
             }
         }
     }
@@ -123,9 +168,16 @@ public class Plugin : BaseUnityPlugin
     {
         if (currentScene.name.StartsWith("Level_") || currentScene.name.StartsWith("Airport"))
         {
-            ReturnBallsToPool();
+            Logger.LogInfo($"Color_SettingChanged called");
 
-            Color standable;
+            ReturnAllBallsToPool();
+
+            freq = configXZFreq.Value;
+            safeFreq = (int)Mathf.Round(freq * 10f);
+            range = Mathf.Round(configRange.Value / freq) * freq; // range needs to be a multiple of frequency for the grid to step properly
+            safeRange = (int)Mathf.Round(range * 10f);
+            maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
+
             if (configStandableBallColor.Value == StandableColor.Green)
             {
                 standable = Color.green;
@@ -135,7 +187,6 @@ public class Plugin : BaseUnityPlugin
                 standable = Color.white;
             }
 
-            Color NonStandable;
             if (configNonStandableBallColor.Value == NonStandableColor.Magenta)
             {
                 NonStandable = Color.magenta;
@@ -144,6 +195,18 @@ public class Plugin : BaseUnityPlugin
             {
                 NonStandable = Color.red;
             }
+
+            if (LastStandableColor != standable || LastNonStandableColor != NonStandable)
+            {
+                ReturnAllBallsToPool();
+
+                // reset last camera to force full redraw for continuous mode
+                nearestGridToCamera.x = 0;
+                nearestGridToCamera.y = 0;
+                nearestGridToCamera.z = 0;
+            }
+
+            poolSize = (int)((2 * range / freq) * (2 * range / freq)) * 4; // adjust pool size based on range and frequency
 
             if (LastStandableColor != standable)
             {
@@ -167,9 +230,38 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    static int highestCount = 0;
+    static int highestBallCount = 0;
+
     private void OnGUI()
     {
         if (!configDebugMode.Value) return;
+
+        int count = 0;
+        int ballCount = 0;
+        foreach (var yDict in positionCache.Values)
+        {
+            count += yDict.list.Count;
+            foreach (var pk in yDict.list.Values)
+            {
+                if (pk != null && pk.ballObject != null)
+                {
+                    ballCount++;
+                }
+            }
+        }
+
+        if (count > highestCount)
+        {
+            highestCount = count;
+        }
+        if (ballCount > highestBallCount)
+        {
+            highestBallCount = ballCount;
+        }
+
+
+
         GUILayout.Label("");
         GUILayout.Label("");
         GUILayout.Label("");
@@ -182,13 +274,32 @@ public class Plugin : BaseUnityPlugin
         GUILayout.Label("");
         GUILayout.Label("");
         GUILayout.Label("");
-        GUILayout.Label("");
-        GUILayout.Label("balls: " + balls.Count);
-        GUILayout.Label("redBalls: " + redBalls.Count);
+        GUILayout.Label("Camera Position: " + focalReferencePoint.ToString("F2"));
+        GUILayout.Label("balls: " + ballCount);
+        GUILayout.Label("highestBallCount: " + highestBallCount);
         GUILayout.Label("pool_balls: " + pool_balls.Count);
         GUILayout.Label("pool_redBalls: " + pool_redBalls.Count);
+        GUILayout.Label("positionCache (x/z count): " + positionCache.Count);
+
+
+        GUILayout.Label("positionCache (total y count): " + count);
+        GUILayout.Label("positionCache (highest total y count): " + highestCount);
+        GUILayout.Label("positionCache (allocations): " + PositionKey.totalAllocations);
+        GUILayout.Label("positionCache (totalInUse): " + PositionKey.totalInUse);
+        GUILayout.Label("positionCache (leaks): " + (PositionKey.totalAllocations - (PositionKey.PoolCount + count)));
+
         GUILayout.Label("alpha: " + alpha);
         GUILayout.Label("isVisualizationRunning: " + isVisualizationRunning.ToString());
+        GUILayout.Label("additionalDebugInfo: " + additionalDebugInfo);
+
+    }
+
+    private void OnDestroy()
+    {
+        foreach (var pk in positionCache.ToList())
+        {
+            RemoveBallsInVerticalRay(pk.Key.Item1, pk.Key.Item2);
+        }
     }
 
     private void OnSceneLoaded(Scene scene, LoadSceneMode _)
@@ -196,16 +307,28 @@ public class Plugin : BaseUnityPlugin
         currentScene = scene;
         // Checking for mainCamera in update because it PROBABLY spawns after scene load for networking reasons but this is a complete guess
 
-        balls.Clear();
-        redBalls.Clear();
+        ReturnAllBallsToPool();
+        
         pool_balls.Clear();
         pool_redBalls.Clear();
+        positionCache.Clear();
+
+
+        freq = configXZFreq.Value;
+        safeFreq = (int)Mathf.Round(freq * 10f);
+        range = Mathf.Round(configRange.Value / freq) * freq; // range needs to be a multiple of frequency for the grid to step properly
+        safeRange = (int)Mathf.Round(range * 10f);
+        maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
+
+
+        nearestGridToCamera.x = 0;
+        nearestGridToCamera.y = 0;
+        nearestGridToCamera.z = 0;
+
 
         if (currentScene.name.StartsWith("Level_") || currentScene.name.StartsWith("Airport"))
         {
             // make pools
-
-            Color standable;
             if (configStandableBallColor.Value == StandableColor.Green)
             {
                 standable = Color.green;
@@ -215,7 +338,6 @@ public class Plugin : BaseUnityPlugin
                 standable = Color.white;
             }
 
-            Color NonStandable;
             if (configNonStandableBallColor.Value == NonStandableColor.Magenta)
             {
                 NonStandable = Color.magenta;
@@ -228,6 +350,8 @@ public class Plugin : BaseUnityPlugin
             LastStandableColor = standable;
             LastNonStandableColor = NonStandable;
 
+            poolSize = (int)((2 * range / freq) * (2 * range / freq)) * 4; // adjust pool size based on range and frequency
+
             for (int i = 0; i < poolSize; i++)
             {
                 pool_balls.Enqueue(CreateBall(standable));
@@ -239,13 +363,14 @@ public class Plugin : BaseUnityPlugin
     private GameObject CreateBall(Color ballColor)
     {
         GameObject ball = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        ball.SetActive(false);
+        ball.SetActive(true);
         ball.GetComponent<Renderer>().material = new(baseMaterial);
         ball.GetComponent<Renderer>().shadowCastingMode = ShadowCastingMode.Off;
         ball.GetComponent<Renderer>().receiveShadows = false;
         ball.GetComponent<Collider>().enabled = false;
         ball.GetComponent<Renderer>().material.SetColor("_BaseColor", ballColor);
         ball.transform.localScale = Vector3.one / 5;
+        ball.transform.position = Vector3.zero + Vector3.down * 5000f;
         return ball;
     }
 
@@ -255,11 +380,54 @@ public class Plugin : BaseUnityPlugin
         {
             if (mainCamera == null)
             {
-                mainCamera = FindFirstObjectByType<MainCamera>();
+                mainCamera = FindFirstObjectByType<MainCamera>()?.GetComponent<Camera>();
                 return;
             }
-            CheckHotkeys();
-            if (configMode.Value == Mode.FadeAway) SetBallAlphas();
+
+            if (configMode.Value == Mode.Continuous)
+            {
+                if (!isVisualizationRunning)
+                {
+                    // For continuous mode, center footholds in front of the camera (range ahead, so the edge of the footholds is at the camera's position. 
+                    // No point in drawing them behind you)
+                    // Consider changing the foothold display area from a simple square to a frustum in front of the camera for performance, 
+                    //  since the square area is often either outside of the camera view (close to camera) 
+                    //  while also being too narrow further from camera and not rendering on the sides
+                    //focalReferencePoint = mainCamera.transform.position + mainCamera.transform.forward * range;
+
+                    Character specCharacter = MainCameraMovement.specCharacter;
+                    if (MainCameraMovement.IsSpectating && specCharacter != null)
+                    {
+                        // in spectator mode, center footholds on the spectated character
+                        focalReferencePoint = specCharacter.refs.ragdoll.partDict[BodypartType.Head].transform.position;
+                    }
+                    else
+                    {
+                        focalReferencePoint = Character.localCharacter.refs.ragdoll.partDict[BodypartType.Head].transform.position;
+                    }
+
+                    isVisualizationRunning = true;
+                    StartCoroutine(RenderChangedVisualizationCoroutine());
+                }
+            }
+            else
+            {
+                Character specCharacter = MainCameraMovement.specCharacter;
+                if (MainCameraMovement.IsSpectating && specCharacter != null)
+                {
+                    // in spectator mode, center footholds on the spectated character
+                    focalReferencePoint = specCharacter.refs.ragdoll.partDict[BodypartType.Head].transform.position;
+                }
+                else
+                {
+                    // For triggered, we want to put them centered around the character, since they persist if you turn around. 
+                    // Don't use camera position in case we're using a 3rd person view mod
+                    focalReferencePoint = Character.localCharacter.refs.ragdoll.partDict[BodypartType.Head].transform.position;
+                }
+
+                CheckHotkeys();
+                if (configMode.Value == Mode.FadeAway) SetBallAlphas();
+            }
         }
     }
 
@@ -269,6 +437,7 @@ public class Plugin : BaseUnityPlugin
         if (Input.GetKeyDown(configActivationKey.Value))
         {
             if (isVisualizationRunning) return;
+            if (configMode.Value == Mode.Continuous) return;
 
             if (configMode.Value == Mode.Trigger)
             {
@@ -288,133 +457,343 @@ public class Plugin : BaseUnityPlugin
             }
             else
             {
-                ReturnBallsToPool();
+                ReturnAllBallsToPool();
             }
         }
     }
 
-    private void ReturnBallsToPool()
+    private void ReturnAllBallsToPool()
     {
-        foreach (GameObject ball in balls.ToList())
+        foreach (var pk in positionCache.ToList())
         {
-            ball.SetActive(false);
-            balls.Dequeue();
-            pool_balls.Enqueue(ball);
-        }
-        foreach (GameObject ball in redBalls.ToList())
-        {
-            ball.SetActive(false);
-            redBalls.Dequeue();
-            pool_redBalls.Enqueue(ball);
+            RemoveBallsInVerticalRay(pk.Key.Item1, pk.Key.Item2);
         }
     }
 
-    // Technically CheckAndPlaceBallAt does the actual rendering, but also technically Unity does the rendering,
-    // but also technically Vulkan/DX12/DX11 does the rendering, but also technically the GPU does the rendering,
-    // all this to say I don't care and I'll name my methods whatever I want
-    private void RenderVisualization()
+    private static void ReturnBallToPool(PositionKey ball)
     {
-        ReturnBallsToPool();
-        lastScanTime = Time.time;
-        float freq = 0.5f;
-        float yFreq = 1f;
-        for (float x = -10; x <= 10; x += freq)
+        if (ball.ballObject != null)
         {
-            for (float y = -10; y <= 10; y += yFreq)
+            ball.ballObject.SetActive(false);
+            totalCalls++;
+            if (ball.standable)
             {
-                for (float z = -10; z <= 10; z += freq)
+                pool_balls.Enqueue(ball.ballObject);
+            }
+            else
+            {
+                pool_redBalls.Enqueue(ball.ballObject);
+            }
+            ball.ballObject = null;
+        }
+    }
+
+
+    private void PlaceBall(PositionKey positionKey)
+    {
+        GameObject ball = null;
+
+        if (positionKey.standable)
+        {
+            if (pool_balls.Count == 0)
+            {
+                for (int i = 0; i < poolSize / 10; i++)
                 {
-                    Vector3 position = new(
-                        mainCamera.transform.position.x + x,
-                        mainCamera.transform.position.y + y,
-                        mainCamera.transform.position.z + z
-                    );
-                    CheckAndPlaceBallAt(position);
+                    pool_balls.Enqueue(CreateBall(standable));
+                    totalCalls++;
                 }
             }
+            ball = pool_balls.Dequeue();
         }
+        else
+        {
+            if (pool_redBalls.Count == 0)
+            {
+                for (int i = 0; i < poolSize / 10; i++)
+                {
+                    pool_redBalls.Enqueue(CreateBall(NonStandable));
+                    totalCalls++;
+                }
+            }
+            ball = pool_redBalls.Dequeue();
+        }
+
+        ball.transform.position = positionKey.position;
+        positionKey.ballObject = ball;
+        ball.SetActive(true);
+
+        totalCalls++;
     }
 
     private IEnumerator RenderVisualizationCoroutine()
     {
-        ReturnBallsToPool();
+        additionalDebugInfo = "";
+
+        ReturnAllBallsToPool();
         lastScanTime = Time.time;
 
-        float freq = 0.5f;
-        float yFreq = 1f;
         int totalCalls = 0;
-        List<Vector3> visiblePositions = [];
-        List<Vector3> nonVisiblePositions = [];
 
         Camera theCamera = Camera.main;
 
-        // First pass: Separate positions into visible and non-visible
-        for (float x = -10; x <= 10; x += freq)
+        // constrain to grid, and quantize to avoid floating point inaccuracies
+        nearestGridToCamera.x = (int)Mathf.Round(Mathf.Round(focalReferencePoint.x / freq) * freq * 10f); 
+        nearestGridToCamera.y = focalReferencePoint.y;
+        nearestGridToCamera.z = (int)Mathf.Round(Mathf.Round(focalReferencePoint.z / freq) * freq * 10f);
+        
+
+        for (int x = -safeRange; x <= safeRange; x += safeFreq)
         {
-            for (float y = -10; y <= 10; y += yFreq)
+            for (int z = -safeRange; z <= safeRange; z += safeFreq)
             {
-                for (float z = -10; z <= 10; z += freq)
+                try
                 {
-                    Vector3 position = new(
-                        mainCamera.transform.position.x + x,
-                        mainCamera.transform.position.y + y,
-                        mainCamera.transform.position.z + z
-                    );
+                    CheckAndPlaceBallsInVerticalRay(nearestGridToCamera.x + x, nearestGridToCamera.y, nearestGridToCamera.z + z, false);
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError(e);
+                }
 
-                    // Uses WorldToViewportPoint() to check if each position is within the camera's view frustum (viewport coordinates 0-1 and z > 0)
-
-                    Vector3 viewportPoint = theCamera.WorldToViewportPoint(position);
-                    bool isVisible =
-                        viewportPoint.x >= 0 && viewportPoint.x <= 1 &&
-                        viewportPoint.y >= 0 && viewportPoint.y <= 1 &&
-                        viewportPoint.z > 0;
-
-                    if (isVisible)
-                    {
-                        visiblePositions.Add(position);
-                    }
-                    else
-                    {
-                        nonVisiblePositions.Add(position);
-                    }
-
-                    if (totalCalls++ % MainYield == 0)
-                        yield return null;
+                if (totalCalls >= maximumRaysPerFrame)
+                {
+                    totalCalls = 0;
+                    yield return null;
                 }
             }
-        }
-
-        // Calls SortWithYield() on both lists to sort by distance to camera for optimization)
-        yield return StartCoroutine(SortWithYield(visiblePositions, theCamera.transform.position, MainYield));
-        yield return StartCoroutine(SortWithYield(nonVisiblePositions, theCamera.transform.position, MainYield));
-
-        totalCalls = 0;
-
-        // Calls CheckAndPlaceBallAt() for each position, starting with visible ones
-
-        // Second pass: Process visible positions first
-        foreach (Vector3 pos in visiblePositions)
-        {
-            if (pool_balls.Count <= 0)
-                break;
-            CheckAndPlaceBallAt(pos);
-            if (totalCalls++ % PlaceYield == 0)
-                yield return null;
-        }
-
-        // Third pass: Process non-visible positions
-        foreach (Vector3 pos in nonVisiblePositions)
-        {
-            if (pool_redBalls.Count <= 0)
-                break;
-            CheckAndPlaceBallAt(pos);
-            if (totalCalls++ % PlaceYield == 0)
-                yield return null;
         }
 
         isVisualizationRunning = false;
     }
 
+
+    private IEnumerator RenderChangedVisualizationCoroutine()
+    {
+        additionalDebugInfo = "";
+
+        lastScanTime = Time.time;
+        
+        totalCalls = 0;
+        
+
+        Rect oldArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange, nearestGridToCamera.z - safeRange, nearestGridToCamera.x + safeRange, nearestGridToCamera.z + safeRange);
+
+        cameraFrustum = new FastFrustum(mainCamera, range);
+
+        // constrain to grid, and quantize to avoid floating point inaccuracies
+        nearestGridToCamera.x = (int)Mathf.Round(Mathf.Round(focalReferencePoint.x / freq) * freq * 10f); 
+        nearestGridToCamera.y = focalReferencePoint.y;
+        nearestGridToCamera.z = (int)Mathf.Round(Mathf.Round(focalReferencePoint.z / freq) * freq * 10f);
+        
+
+        Rect newArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange, nearestGridToCamera.z - safeRange, nearestGridToCamera.x + safeRange, nearestGridToCamera.z + safeRange);
+        
+
+        var newAreas = SubtractRect(newArea, oldArea);
+        var expiredAreas = SubtractRect(oldArea, newArea);
+
+
+        // Find actual intersection (clamped to outer)
+        float xMin = Mathf.Max(newArea.xMin, oldArea.xMin);
+        float xMax = Mathf.Min(newArea.xMax, oldArea.xMax);
+        float yMin = Mathf.Max(newArea.yMin, oldArea.yMin);
+        float yMax = Mathf.Min(newArea.yMax, oldArea.yMax);
+
+        Rect unchangedArea = Rect.zero; 
+        
+        if (xMax > xMin && yMax > yMin)
+        {
+            unchangedArea = Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+        }
+
+
+        var (minX, maxX, minZ, maxZ) = cameraFrustum.GetFrequencyQuantizedXZFrustumBounds(freq);
+        Rect recheckArea = Rect.MinMaxRect(minX, minZ, maxX, maxZ);
+
+        foreach (var area in newAreas)
+        {
+            int axMax = (int)Mathf.Round(area.xMax);
+            int ayMax = (int)Mathf.Round(area.yMax);
+
+            for (int x = (int)Mathf.Round(area.xMin); x <= axMax; x += safeFreq)
+            {
+                for (int z = (int)Mathf.Round(area.yMin); z <= ayMax; z += safeFreq)
+                {
+                    try
+                    {
+                        CheckCacheMiss(x, z);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
+
+                    if (totalCalls >= maximumRaysPerFrame)
+                    {
+                        totalCalls = 0;
+                        yield return null;
+                    }
+                    
+                    try
+                    {
+                        PlaceBallsInVerticalRay(x, nearestGridToCamera.y, z, true);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
+
+                    if (totalCalls >= maximumRaysPerFrame)
+                    {
+                        totalCalls = 0;
+                        yield return null;
+                    }
+                }
+            }
+        }
+
+        foreach (var area in expiredAreas)
+        {
+            int axMax = (int)Mathf.Round(area.xMax);
+            int ayMax = (int)Mathf.Round(area.yMax);
+
+            for (int x = (int)Mathf.Round(area.xMin); x <= axMax; x += safeFreq)
+            {
+                for (int z = (int)Mathf.Round(area.yMin); z <= ayMax; z += safeFreq)
+                {
+                    try
+                    {
+                        RemoveBallsInVerticalRay(x, z);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
+
+                    if (totalCalls >= maximumRaysPerFrame)
+                    {
+                        totalCalls = 0;
+                        yield return null;
+                    }
+                }
+            }
+        }
+
+
+        {
+            Rect area = recheckArea;
+
+            int axMax = (int)Mathf.Round(area.xMax);
+            int ayMax = (int)Mathf.Round(area.yMax);
+
+            for (int x = (int)Mathf.Round(area.xMin); x <= axMax; x += safeFreq)
+            {
+                for (int z = (int)Mathf.Round(area.yMin); z <= ayMax; z += safeFreq)
+                {
+                    try
+                    {
+                        PlaceBallsInVerticalRay(x, nearestGridToCamera.y, z, true);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
+
+                    if (totalCalls >= maximumRaysPerFrame)
+                    {
+                        totalCalls = 0;
+                        yield return null;
+                    }
+                }
+            }
+        }
+
+        isVisualizationRunning = false;
+    }
+
+    public static List<Rect> SubtractRect(Rect original, Rect cut)
+    {
+        var result = new List<Rect>();
+
+        // Find actual intersection (clamped to outer)
+        float xMin = Mathf.Max(original.xMin, cut.xMin);
+        float xMax = Mathf.Min(original.xMax, cut.xMax);
+        float yMin = Mathf.Max(original.yMin, cut.yMin);
+        float yMax = Mathf.Min(original.yMax, cut.yMax);
+
+        // If there is no overlap, return the original outer
+        if (xMax <= xMin || yMax <= yMin)
+        {
+            result.Add(original);
+            return result;
+        }
+
+        Rect cutArea = Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+
+        // --- Bottom strip (below intersection), full width of outer ---
+        if (cutArea.yMin > original.yMin)
+        {
+            Rect bottom = new Rect(
+                original.xMin,
+                original.yMin,
+                original.width,
+                cutArea.yMin - original.yMin
+            );
+            result.Add(bottom);
+        }
+
+        // --- Top strip (above intersection), full width of outer ---
+        if (cutArea.yMax < original.yMax)
+        {
+            Rect top = new Rect(
+                original.xMin,
+                cutArea.yMax,
+                original.width,
+                original.yMax - cutArea.yMax
+            );
+            result.Add(top);
+        }
+
+        // --- Left strip (beside intersection), height of intersection only ---
+        if (cutArea.xMin > original.xMin)
+        {
+            Rect left = new Rect(
+                original.xMin,
+                cutArea.yMin,
+                cutArea.xMin - original.xMin,
+                cutArea.height
+            );
+            result.Add(left);
+        }
+
+        // --- Right strip (beside intersection), height of intersection only ---
+        if (cutArea.xMax < original.xMax)
+        {
+            Rect right = new Rect(
+                cutArea.xMax,
+                cutArea.yMin,
+                original.xMax - cutArea.xMax,
+                cutArea.height
+            );
+            result.Add(right);
+        }
+
+        return result;
+    }
+
+
+
+    // Not going to try to fix right now, but couple issues with this:
+    // 1. Sorting in chunks means the overall list isn't fully sorted, just partially sorted in chunks - this alone negates the purpose of the sorting, since it will just look random anyway
+    // 2. Yielding during the replacement phase means that the list is in an inconsistent state while being sorted (duplicate entries, missing entries, etc). 
+    //    Probably not a big deal unless something else accesses the list while being sorted, but still not ideal
+    // 3. The sorting and custom comparison delegate adds processing time, which may negate the perceived performance gain that sorting is attempting to gain
+    //
+    // A temporary fix for the inconsistency is to only yield between chunks, while working on a temporary list, 
+    // but this is still not ideal, since the entire list should be sorted as a whole, not in chunks
+    // A full fix would require a different sorting algorithm that can be paused and resumed, which is non-trivial
+    // For now, I'm going to disable sorting, since the perceived performance gain is minimal compared to the complexity introduced
+    // especially in light of the other optimizations made (full vertical rays, caching)
     IEnumerator SortWithYield(List<Vector3> list, Vector3 cameraPosition, int chunkSize)
     {
         int n = list.Count;
@@ -442,7 +821,7 @@ public class Plugin : BaseUnityPlugin
                 list[i + j] = chunk[j];
                 totalIterations++;
 
-                if (totalIterations % MainYield == 0)
+                if (totalIterations % maximumRaysPerFrame == 0)
                 {
                     yield return null;
                 }
@@ -450,40 +829,110 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    // Most of this code was "borrowed" from CharacterMovement.RaycastGroundCheck
-    private void CheckAndPlaceBallAt(Vector3 position)
+    private void CheckAndPlaceBallsInVerticalRay(int x, float y, int z, bool onlyInFrustum)
     {
-        Vector3 to = position + Vector3.down * 1;
-        RaycastHit raycastHit = HelperFunctions.LineCheck(position, to, HelperFunctions.LayerType.TerrainMap, 0f, QueryTriggerInteraction.Ignore);
-        if (raycastHit.transform)
+        CheckCacheMiss(x, z);
+
+        PlaceBallsInVerticalRay(x, y, z, onlyInFrustum);
+    }
+
+    
+    private void PlaceBallsInVerticalRay(int x, float y, int z, bool onlyInFrustum)
+    {
+        if (positionCache.TryGetValue((x, z), out var yDict))
         {
-            CollisionModifier component = raycastHit.collider.GetComponent<CollisionModifier>();
-            if (component)
+            PlaceBallsInVerticalRay(yDict, y, onlyInFrustum);
+        }
+    }
+    private void PlaceBallsInVerticalRay(PositionYList yDict, float y, bool onlyInFrustum)
+    {
+        foreach (var kvp in yDict.list)
+        {
+            PositionKey cachedKey = kvp.Value;
+            bool inFrustum;
+
+            if (cachedKey != null)
             {
-                if (!component.standable)
+                if (onlyInFrustum)
                 {
-                    return;
+                    inFrustum = cameraFrustum.Contains(cachedKey.position);
                 }
-            }
-            float angle = Vector3.Angle(Vector3.up, raycastHit.normal);
-            if (angle > 30f) // lower limit on the angle because showing balls on flat ground is pretty pointless
-            {
-                if (angle < 50f && pool_balls.Count > 0)
+                else
                 {
-                    GameObject ball = pool_balls.Dequeue();
-                    ball.transform.position = raycastHit.point;
-                    balls.Enqueue(ball);
-                    ball.SetActive(true);
+                    float yDist = Mathf.Abs(y - cachedKey.position.y);
+                    inFrustum = yDist <= range;
                 }
-                else if (angle >= 50f && pool_redBalls.Count > 0)
+
+                if (cachedKey.ballObject == null && inFrustum)
                 {
-                    GameObject ball = pool_redBalls.Dequeue();
-                    ball.transform.position = raycastHit.point;
-                    redBalls.Enqueue(ball);
-                    ball.SetActive(true);
+                    PlaceBall(cachedKey);
+                }
+                else if (cachedKey.ballObject != null && !inFrustum)
+                {
+                    ReturnBallToPool(cachedKey);
                 }
             }
         }
+    }
+
+    private void RemoveBallsInVerticalRay(int xIndex, int zIndex)
+    {
+        if (positionCache.TryGetValue((xIndex, zIndex), out var yDict))
+        {
+            positionCache.Remove((xIndex, zIndex)); // clear cache for this vertical line. Consider keeping it for a certain larger radius?
+            yDict.ReturnToPool();
+        }
+    }
+
+    private bool CheckCacheMiss(int x, int z)
+    {
+        // cache miss, need to do raycasts to build cache for this vertical line
+        if (!positionCache.ContainsKey((x, z)))
+        {
+            var pCache = PositionYList.GetNew();
+            
+            // Raycast downwards from the position to check for terrain.
+            // Do a full vertical line, and cache all results for this (x,z) position
+            // Stop the line just before 0 y, since we don't need to be visualizing the shallow water floor
+            // Remember that x/z are increased in magnitude for index purposes
+            Vector3 from = new Vector3(x/10f, 100000f, z/10f);
+
+            int hitcount = Physics.RaycastNonAlloc(from, Vector3.down, _terrainHitBuffer, 99999f, HelperFunctions.GetMask(HelperFunctions.LayerType.TerrainMap), QueryTriggerInteraction.UseGlobal);
+
+            totalCalls++;
+
+            for (int i = 0; i < hitcount; i++)
+            {
+                RaycastHit raycastHit = _terrainHitBuffer[i];
+
+                if (!raycastHit.transform) continue;
+
+                if (raycastHit.point.y < 0.5f) continue; // ignore surfaces below sea level
+
+                CollisionModifier component = raycastHit.collider.GetComponent<CollisionModifier>();
+                if (component && !component.standable) continue;
+
+                float angle = Vector3.Angle(Vector3.up, raycastHit.normal);
+
+                if (angle < 30f) continue; // don't need to show on flat ground
+
+                if (pCache.list.ContainsKey((int)Mathf.Round(raycastHit.point.y * 10f))) continue;
+
+                PositionKey positionKey = PositionKey.GetNew(
+                    raycastHit.point.x,
+                    raycastHit.point.y,
+                    raycastHit.point.z,
+                    angle < 50f
+                );
+                
+                pCache.list.Add((int)Mathf.Round(raycastHit.point.y * 10f), positionKey);
+            }
+            
+            positionCache[(x, z)] = pCache;
+
+            return true;
+        }
+        return false;
     }
 
     // This method is dedicated to VicVoss
@@ -497,35 +946,25 @@ public class Plugin : BaseUnityPlugin
 
         alpha = Mathf.Lerp(1f, 0f, Mathf.Clamp01((Time.time - (lastScanTime + 3)) / 3));
 
-        foreach (GameObject ball in balls.Concat(redBalls))
+        foreach (var pkc in positionCache.Values)
         {
-            Material mat = ball.GetComponent<Renderer>().material;
-            Color baseColor = mat.GetColor("_BaseColor");
-            baseColor.a = alpha;
-            mat.SetColor("_BaseColor", baseColor);
+            foreach (var ball in pkc.list.Values)
+            {
+                if (ball != null)
+                {
+                    if (ball.ballObject == null) continue;
+                    Material mat = ball.ballObject.GetComponent<Renderer>().material;
+                    Color baseColor = mat.GetColor("_BaseColor");
+                    baseColor.a = alpha;
+                    mat.SetColor("_BaseColor", baseColor);
+                }
+            }
         }
 
         if (alpha <= 0)
-            {
-                if (balls.Count > 0)
-                {
-                    foreach (GameObject ball in balls.ToList()) // ToList used to clone the list because you can't modify what you're enumerating
-                    {
-                        ball.SetActive(false);
-                        balls.Dequeue();
-                        pool_balls.Enqueue(ball);
-                    }
-                }
-                if (redBalls.Count > 0)
-                {
-                    foreach (GameObject ball in redBalls.ToList()) // ToList used to clone the list because you can't modify what you're enumerating
-                    {
-                        ball.SetActive(false);
-                        redBalls.Dequeue();
-                        pool_redBalls.Enqueue(ball);
-                    }
-                }
-            }
+        {
+            ReturnAllBallsToPool();
+        }
     }
 
     internal enum StandableColor
@@ -544,6 +983,303 @@ public class Plugin : BaseUnityPlugin
     {
         Toggle,
         FadeAway,
-        Trigger
+        Trigger,
+        Continuous
     }
+
+    
+    class PositionKey
+    {
+        private static readonly Queue<PositionKey> pool = new Queue<PositionKey>();
+        public static int PoolCount => pool.Count;
+        private static int poolSize = 40000;
+        public static int totalAllocations = 0;
+        public static int totalInUse = 0;
+
+
+        private bool isInUse = false;
+
+        public Vector3 position;
+        public bool standable;
+        public GameObject ballObject;
+
+        
+        static PositionKey()
+        {
+            for (int i = 0; i < poolSize; i++)
+            {
+                pool.Enqueue(new PositionKey());
+                totalAllocations++;
+            }
+        }
+
+        
+        private PositionKey()
+        {
+            
+        }
+
+        public static PositionKey GetNew(float x, float y, float z, bool standable, GameObject ballObject = null)
+        {
+            if (pool.Count <= 0)
+            {
+                for (int i = 0; i < poolSize / 5; i++)
+                {
+                    pool.Enqueue(new PositionKey());
+                    totalAllocations++;
+                }
+            }
+            PositionKey drop = pool.Dequeue();
+            drop.position = new Vector3(x, y, z);
+            drop.standable = standable;
+            drop.ballObject = ballObject;
+            drop.isInUse = true;
+            totalInUse++;
+            return drop;
+
+        }
+
+        public static PositionKey GetNew(Vector3 position, bool standable, GameObject ballObject = null)
+        {
+            if (pool.Count <= 0)
+            {
+                for (int i = 0; i < poolSize / 5; i++)
+                {
+                    pool.Enqueue(new PositionKey());
+                    totalAllocations++;
+                }
+            }
+            PositionKey drop = pool.Dequeue();
+            drop.position = position;
+            drop.standable = standable;
+            drop.ballObject = ballObject;
+            drop.isInUse = true;
+            totalInUse++;
+            return drop;
+        }
+
+        public void ReturnToPool()
+        {
+            if (isInUse == false) return;
+
+            ReturnBallToPool(this);
+            position = Vector3.zero;
+            standable = false;
+            ballObject = null;
+            isInUse = false;
+            pool.Enqueue(this);
+            totalInUse--;
+        }
+    }
+
+    class PositionYList
+    {
+        private static readonly Queue< PositionYList > pool = new Queue< PositionYList >();
+        public static int PoolCount => pool.Count;
+        private static int poolSize = 10000;
+        public static int totalAllocations = 0;
+        public static int totalInUse = 0;
+
+
+        private bool isInUse = false;
+
+        public readonly Dictionary<int, PositionKey> list = new();
+
+        
+        static PositionYList()
+        {
+            for (int i = 0; i < poolSize; i++)
+            {
+                pool.Enqueue(new PositionYList());
+                totalAllocations++;
+            }
+        }
+
+        
+        private PositionYList()
+        {
+            
+        }
+
+        public static PositionYList GetNew()
+        {
+            if (pool.Count <= 0)
+            {
+                for (int i = 0; i < poolSize / 5; i++)
+                {
+                    pool.Enqueue(new PositionYList());
+                    totalAllocations++;
+                }
+            }
+            PositionYList drop = pool.Dequeue();
+            drop.list.Clear();
+            drop.isInUse = true;
+            totalInUse++;
+            return drop;
+
+        }
+
+        public void ReturnToPool()
+        {
+            if (isInUse == false) return;
+
+            totalInUse--;
+            isInUse = false;
+
+            foreach (var pk in list.Values)
+            {
+                if (pk != null)
+                {
+                    pk.ReturnToPool();
+                }
+            }
+
+            list.Clear();
+            pool.Enqueue(this);
+        }
+    }
+
+    public struct FastFrustum
+    {
+        public Vector3 camPos;
+        public Vector3 forward;
+        public Vector3 right;
+        public Vector3 up;
+
+        public float near;
+        public float far;
+
+        public float tanHalfVertFov;
+        public float tanHalfHorFov;
+
+        public FastFrustum(Camera cam, float farClipPlaneOverride = -1f)
+        {
+            Transform t = cam.transform;
+
+            camPos   = t.position;
+            forward  = t.forward;
+            right    = t.right;
+            up       = t.up;
+
+            near = cam.nearClipPlane;
+            far  = cam.farClipPlane;
+
+            if (farClipPlaneOverride > 0f)
+            {
+                far  = farClipPlaneOverride;
+            }
+
+            float halfVertRad = 0.5f * cam.fieldOfView * Mathf.Deg2Rad;
+            tanHalfVertFov = Mathf.Tan(halfVertRad);
+            tanHalfHorFov  = tanHalfVertFov * cam.aspect;
+        }
+
+        public bool Contains(Vector3 point)
+        {
+            // Vector from camera to point
+            Vector3 v = point - camPos;
+
+            // Distance along camera forward
+            float z = Vector3.Dot(v, forward);
+            if (z < near || z > far)
+                return false;
+
+            // Offsets in camera's right / up directions
+            float x = Vector3.Dot(v, right);
+            float y = Vector3.Dot(v, up);
+
+            float maxY = z * tanHalfVertFov;
+            float maxX = z * tanHalfHorFov;
+
+            if (Mathf.Abs(x) > maxX) return false;
+            if (Mathf.Abs(y) > maxY) return false;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Gets the grid restricted quantized axis-aligned bounding box of the frustum projected onto the XZ plane.
+        /// </summary>
+        /// <returns>ValueTuple(int minX, int maxX, int minZ, int maxZ)</returns>
+        public (int, int, int, int) GetFrequencyQuantizedXZFrustumBounds(float freq)
+        {
+            var (minX, maxX, minZ, maxZ) = GetXZFrustumBounds();
+
+            int qMinX = (int)Mathf.Floor(Mathf.Floor(minX / freq) * freq * 10f);
+            int qMaxX = (int)Mathf.Ceil(Mathf.Ceil(maxX / freq) * freq * 10f);
+            int qMinZ = (int)Mathf.Floor(Mathf.Floor(minZ / freq) * freq * 10f);
+            int qMaxZ = (int)Mathf.Ceil(Mathf.Ceil(maxZ / freq) * freq * 10f);
+
+            return (qMinX, qMaxX, qMinZ, qMaxZ);
+        }
+
+
+        /// <summary>
+        /// Gets the axis-aligned bounding box of the frustum projected onto the XZ plane.
+        /// </summary>
+        /// <returns>ValueTuple(float minX, float maxX, float minZ, float maxZ)</returns>
+        public (float, float, float, float) GetXZFrustumBounds()
+        {
+            float minX;
+            float maxX;
+            float minZ;
+            float maxZ;
+
+            // Frustum dimensions on near/far planes
+            float nearHalfHeight = near * tanHalfVertFov;
+            float nearHalfWidth  = near * tanHalfHorFov;
+
+            float farHalfHeight  = far * tanHalfVertFov;
+            float farHalfWidth   = far * tanHalfHorFov;
+
+            // Centers of near and far planes
+            Vector3 centerNear = camPos + forward * near;
+            Vector3 centerFar  = camPos + forward * far;
+
+            // 4 corners of near plane
+            Vector3 nearTL = centerNear + up * nearHalfHeight - right * nearHalfWidth;
+            Vector3 nearTR = centerNear + up * nearHalfHeight + right * nearHalfWidth;
+            Vector3 nearBL = centerNear - up * nearHalfHeight - right * nearHalfWidth;
+            Vector3 nearBR = centerNear - up * nearHalfHeight + right * nearHalfWidth;
+
+            // 4 corners of far plane
+            Vector3 farTL  = centerFar + up * farHalfHeight - right * farHalfWidth;
+            Vector3 farTR  = centerFar + up * farHalfHeight + right * farHalfWidth;
+            Vector3 farBL  = centerFar - up * farHalfHeight - right * farHalfWidth;
+            Vector3 farBR  = centerFar - up * farHalfHeight + right * farHalfWidth;
+
+            minX = float.PositiveInfinity;
+            maxX = float.NegativeInfinity;
+            minZ = float.PositiveInfinity;
+            maxZ = float.NegativeInfinity;
+
+            void Encapsulate(Vector3 p)
+            {
+                if (p.x < minX) minX = p.x;
+                if (p.x > maxX) maxX = p.x;
+                if (p.z < minZ) minZ = p.z;
+                if (p.z > maxZ) maxZ = p.z;
+            }
+
+            Encapsulate(nearTL);
+            Encapsulate(nearTR);
+            Encapsulate(nearBL);
+            Encapsulate(nearBR);
+
+            Encapsulate(farTL);
+            Encapsulate(farTR);
+            Encapsulate(farBL);
+            Encapsulate(farBR);
+
+            return (minX, maxX, minZ, maxZ);
+        }
+    }
+
+    struct SafeXZ
+    {
+        public int x;
+        public float y;
+        public int z;
+    }
+
 }
