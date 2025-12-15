@@ -206,7 +206,7 @@ public class Plugin : BaseUnityPlugin
                 nearestGridToCamera.z = 0;
             }
 
-            poolSize = (int)((2 * range / freq) * (2 * range / freq)) * 4; // adjust pool size based on range and frequency
+            poolSize = (int)((2 * range / freq) * (2 * range / freq)); // adjust pool size based on range and frequency
 
             if (LastStandableColor != standable)
             {
@@ -350,7 +350,7 @@ public class Plugin : BaseUnityPlugin
             LastStandableColor = standable;
             LastNonStandableColor = NonStandable;
 
-            poolSize = (int)((2 * range / freq) * (2 * range / freq)) * 4; // adjust pool size based on range and frequency
+            poolSize = (int)((2 * range / freq) * (2 * range / freq)); // adjust pool size based on range and frequency
 
             for (int i = 0; i < poolSize; i++)
             {
@@ -384,33 +384,7 @@ public class Plugin : BaseUnityPlugin
                 return;
             }
 
-            if (configMode.Value == Mode.Continuous)
-            {
-                if (!isVisualizationRunning)
-                {
-                    // For continuous mode, center footholds in front of the camera (range ahead, so the edge of the footholds is at the camera's position. 
-                    // No point in drawing them behind you)
-                    // Consider changing the foothold display area from a simple square to a frustum in front of the camera for performance, 
-                    //  since the square area is often either outside of the camera view (close to camera) 
-                    //  while also being too narrow further from camera and not rendering on the sides
-                    //focalReferencePoint = mainCamera.transform.position + mainCamera.transform.forward * range;
-
-                    Character specCharacter = MainCameraMovement.specCharacter;
-                    if (MainCameraMovement.IsSpectating && specCharacter != null)
-                    {
-                        // in spectator mode, center footholds on the spectated character
-                        focalReferencePoint = specCharacter.refs.ragdoll.partDict[BodypartType.Head].transform.position;
-                    }
-                    else
-                    {
-                        focalReferencePoint = Character.localCharacter.refs.ragdoll.partDict[BodypartType.Head].transform.position;
-                    }
-
-                    isVisualizationRunning = true;
-                    StartCoroutine(RenderChangedVisualizationCoroutine());
-                }
-            }
-            else
+            if (!isVisualizationRunning)
             {
                 Character specCharacter = MainCameraMovement.specCharacter;
                 if (MainCameraMovement.IsSpectating && specCharacter != null)
@@ -420,11 +394,21 @@ public class Plugin : BaseUnityPlugin
                 }
                 else
                 {
-                    // For triggered, we want to put them centered around the character, since they persist if you turn around. 
                     // Don't use camera position in case we're using a 3rd person view mod
                     focalReferencePoint = Character.localCharacter.refs.ragdoll.partDict[BodypartType.Head].transform.position;
                 }
+            }
 
+            if (configMode.Value == Mode.Continuous)
+            {
+                if (!isVisualizationRunning)
+                {
+                    isVisualizationRunning = true;
+                    StartCoroutine(RenderChangedVisualizationCoroutine());
+                }
+            }
+            else
+            {
                 CheckHotkeys();
                 if (configMode.Value == Mode.FadeAway) SetBallAlphas();
             }
@@ -534,13 +518,12 @@ public class Plugin : BaseUnityPlugin
 
         int totalCalls = 0;
 
-        Camera theCamera = Camera.main;
-
         // constrain to grid, and quantize to avoid floating point inaccuracies
         nearestGridToCamera.x = (int)Mathf.Round(Mathf.Round(focalReferencePoint.x / freq) * freq * 10f); 
         nearestGridToCamera.y = focalReferencePoint.y;
         nearestGridToCamera.z = (int)Mathf.Round(Mathf.Round(focalReferencePoint.z / freq) * freq * 10f);
         
+        cameraFrustum = new FastFrustum(mainCamera, range);
 
         for (int x = -safeRange; x <= safeRange; x += safeFreq)
         {
@@ -570,50 +553,33 @@ public class Plugin : BaseUnityPlugin
     private IEnumerator RenderChangedVisualizationCoroutine()
     {
         additionalDebugInfo = "";
-
         lastScanTime = Time.time;
-        
         totalCalls = 0;
         
-
         var (minX, maxX, minZ, maxZ) = cameraFrustum.GetFrequencyQuantizedXZFrustumBounds(freq);
 
         Rect oldArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange, nearestGridToCamera.z - safeRange, nearestGridToCamera.x + safeRange, nearestGridToCamera.z + safeRange);
+        Rect oldCacheKeepArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange*2, nearestGridToCamera.z - safeRange*2, nearestGridToCamera.x + safeRange*2, nearestGridToCamera.z + safeRange*2);
         Rect oldRecheckArea = Rect.MinMaxRect(minX, minZ, maxX, maxZ);
-
-        cameraFrustum = new FastFrustum(mainCamera, range);
 
         // constrain to grid, and quantize to avoid floating point inaccuracies
         nearestGridToCamera.x = (int)Mathf.Round(Mathf.Round(focalReferencePoint.x / freq) * freq * 10f); 
         nearestGridToCamera.y = focalReferencePoint.y;
         nearestGridToCamera.z = (int)Mathf.Round(Mathf.Round(focalReferencePoint.z / freq) * freq * 10f);
         
-
-        Rect newArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange, nearestGridToCamera.z - safeRange, nearestGridToCamera.x + safeRange, nearestGridToCamera.z + safeRange);
-        
-
-        var newAreas = SubtractRect(newArea, oldArea);
-        var expiredAreas = SubtractRect(oldArea, newArea);
-
-
-        // Find actual intersection (clamped to outer)
-        float xMin = Mathf.Max(newArea.xMin, oldArea.xMin);
-        float xMax = Mathf.Min(newArea.xMax, oldArea.xMax);
-        float yMin = Mathf.Max(newArea.yMin, oldArea.yMin);
-        float yMax = Mathf.Min(newArea.yMax, oldArea.yMax);
-
-        Rect unchangedArea = Rect.zero; 
-        
-        if (xMax > xMin && yMax > yMin)
-        {
-            unchangedArea = Rect.MinMaxRect(xMin, yMin, xMax, yMax);
-        }
-
+        cameraFrustum = new FastFrustum(mainCamera, range);
 
         (minX, maxX, minZ, maxZ) = cameraFrustum.GetFrequencyQuantizedXZFrustumBounds(freq);
+
+        Rect newArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange, nearestGridToCamera.z - safeRange, nearestGridToCamera.x + safeRange, nearestGridToCamera.z + safeRange);
+        Rect newCacheKeepArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange*2, nearestGridToCamera.z - safeRange*2, nearestGridToCamera.x + safeRange*2, nearestGridToCamera.z + safeRange*2);
         Rect recheckArea = Rect.MinMaxRect(minX, minZ, maxX, maxZ);
 
+        var newAreas = SubtractRect(newArea, oldArea);
+        var expiredCacheKeepAreas = SubtractRect(oldCacheKeepArea, newCacheKeepArea);
         var expiredRecheckAreas = SubtractRect(oldRecheckArea, recheckArea);
+
+        PositionYList pCache = null;
 
         foreach (var area in newAreas)
         {
@@ -626,7 +592,7 @@ public class Plugin : BaseUnityPlugin
                 {
                     try
                     {
-                        CheckCacheMiss(x, z);
+                        pCache = CheckCacheMiss(x, nearestGridToCamera.y, z);
                     }
                     catch (Exception e)
                     {
@@ -641,7 +607,7 @@ public class Plugin : BaseUnityPlugin
                     
                     try
                     {
-                        PlaceBallsInVerticalRay(x, nearestGridToCamera.y, z, true);
+                        PlaceBallsInVerticalRay(pCache, nearestGridToCamera.y, true);
                     }
                     catch (Exception e)
                     {
@@ -657,7 +623,7 @@ public class Plugin : BaseUnityPlugin
             }
         }
 
-        foreach (var area in expiredAreas)
+        foreach (var area in expiredCacheKeepAreas)
         {
             int axMax = (int)Mathf.Round(area.xMax);
             int ayMax = (int)Mathf.Round(area.yMax);
@@ -726,7 +692,22 @@ public class Plugin : BaseUnityPlugin
                 {
                     try
                     {
-                        PlaceBallsInVerticalRay(x, nearestGridToCamera.y, z, true);
+                        pCache = CheckCacheMiss(x, nearestGridToCamera.y, z);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
+
+                    if (totalCalls >= maximumRaysPerFrame)
+                    {
+                        totalCalls = 0;
+                        yield return null;
+                    }
+                    
+                    try
+                    {
+                        PlaceBallsInVerticalRay(pCache, nearestGridToCamera.y, true);
                     }
                     catch (Exception e)
                     {
@@ -866,9 +847,9 @@ public class Plugin : BaseUnityPlugin
 
     private void CheckAndPlaceBallsInVerticalRay(int x, float y, int z, bool onlyInFrustum)
     {
-        CheckCacheMiss(x, z);
+        var pCache = CheckCacheMiss(x, y, z);
 
-        PlaceBallsInVerticalRay(x, y, z, onlyInFrustum);
+        PlaceBallsInVerticalRay(pCache, y, onlyInFrustum);
     }
 
     
@@ -933,22 +914,33 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private bool CheckCacheMiss(int x, int z)
+    private PositionYList CheckCacheMiss(int x, float y, int z)
     {
+        PositionYList pCache = null;
+
         // cache miss, need to do raycasts to build cache for this vertical line
-        if (!positionCache.ContainsKey((x, z)))
+        if (!positionCache.TryGetValue((x, z), out pCache) || pCache == null || pCache.rayTop < y + range || pCache.rayBottom > y - range)
         {
-            var pCache = PositionYList.GetNew();
-            
+            if (pCache != null)
+            {
+                positionCache.Remove((x, z));
+                pCache.ReturnToPool();
+            }
+
+            pCache = PositionYList.GetNew();
+
             // Raycast downwards from the position to check for terrain.
             // Do a full vertical line, and cache all results for this (x,z) position
             // Stop the line just before 0 y, since we don't need to be visualizing the shallow water floor
             // Remember that x/z are increased in magnitude for index purposes
-            Vector3 from = new Vector3(x/10f, 100000f, z/10f);
+            Vector3 from = new Vector3(x/10f, y + range * 2f, z/10f);
 
-            int hitcount = Physics.RaycastNonAlloc(from, Vector3.down, _terrainHitBuffer, 99999f, HelperFunctions.GetMask(HelperFunctions.LayerType.TerrainMap), QueryTriggerInteraction.UseGlobal);
+            int hitcount = Physics.RaycastNonAlloc(from, Vector3.down, _terrainHitBuffer, range * 4f, HelperFunctions.GetMask(HelperFunctions.LayerType.TerrainMap), QueryTriggerInteraction.UseGlobal);
 
             totalCalls++;
+
+            pCache.rayTop = from.y;
+            pCache.rayBottom = from.y - range * 4f;
 
             for (int i = 0; i < hitcount; i++)
             {
@@ -978,10 +970,8 @@ public class Plugin : BaseUnityPlugin
             }
             
             positionCache[(x, z)] = pCache;
-
-            return true;
         }
-        return false;
+        return pCache;
     }
 
     // This method is dedicated to VicVoss
@@ -1130,9 +1120,11 @@ public class Plugin : BaseUnityPlugin
         public static int totalInUse = 0;
 
 
-        private bool isInUse = false;
 
         public readonly Dictionary<int, PositionKey> list = new();
+        private bool isInUse = false;
+        public float rayTop = 0;
+        public float rayBottom = 0;
 
         
         static PositionYList()
