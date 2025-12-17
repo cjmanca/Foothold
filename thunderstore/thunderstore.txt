@@ -3,6 +3,7 @@ To assemble the Thunderstore package, zip these files:
 icon.png - From <repo>/thunderstore/
 LICENSE - From <repo>/
 manifest.json - From <repo>/thunderstore/
+Assets/ - From <repo>/thunderstore/
 README.md - From <repo>/
 Foothold.dll - From <repo>/bin/Debug/netstandard2.1/
 

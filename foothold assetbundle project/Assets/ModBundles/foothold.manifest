@@ -1,0 +1,24 @@
+ManifestFileVersion: 0
+UnityVersion: 6000.0.36f1
+CRC: 2887581609
+Hashes:
+  AssetFileHash:
+    serializedVersion: 2
+    Hash: c24855a6a5fd2d5f29cd0c29c3d7288a
+  TypeTreeHash:
+    serializedVersion: 2
+    Hash: 4afb0d898c1c22a5e88248733bd69457
+  IncrementalBuildHash:
+    serializedVersion: 2
+    Hash: 09ec9766cbdcf5c046a894f2263eaeda
+HashAppended: 0
+ClassTypes:
+- Class: 21
+  Script: {instanceID: 0}
+- Class: 48
+  Script: {instanceID: 0}
+SerializeReferenceClassIdentifiers: []
+Assets:
+- Assets/FootholdAssets/Lit Instanced.shader
+- Assets/FootholdAssets/Foothold.mat
+Dependencies: []
