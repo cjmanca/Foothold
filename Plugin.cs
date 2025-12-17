@@ -23,16 +23,28 @@ public class Plugin : BaseUnityPlugin
     internal static Vector3 focalReferencePoint;
     internal static FastFrustum cameraFrustum;
     internal static bool activated = false;
-    internal static Material baseMaterial;
+
+    static Vector3 scale = new Vector3(0.2f, 0.2f, 0.2f);
+
+    static List<Matrix4x4[]> standableMatrices = new();
+    static List<PositionKey[]> linkedStandableMatrices = new();
+    static List<Matrix4x4[]> nonStandableMatrices = new();
+    static List<PositionKey[]> linkedNonStandableMatrices = new();
+    static (int, int) nextFreeStandableMatrixIndex = (0, 0);
+    static (int, int) nextFreeNonStandableMatrixIndex = (0, 0);
+
+    static int cullingLayer = 0;
+    static RenderParams standableRP;
+    static RenderParams nonStandableRP;
+    internal static Material standableMaterial;
+    internal static Material nonStandableMaterial;
     internal static float alpha = 1;
     internal static bool continuousPaused = false;
 
     private static readonly Dictionary<(int, int), PositionYList> positionCache = new();
     
     private static readonly RaycastHit[] _terrainHitBuffer = new RaycastHit[1000];
-
-    private static readonly Queue<GameObject> pool_balls = [];
-    private static readonly Queue<GameObject> pool_redBalls = [];
+    private static Mesh ballMesh;
     private static float lastScanTime = 0; // should only be needed when fade away is on
     private static float lastAlphaChangeTime = 0; // should only be needed when fade away is on
 
@@ -62,7 +74,6 @@ public class Plugin : BaseUnityPlugin
     private Color LastNonStandableColor = Color.red;
     private static float scalePercent = 1f;
 
-    private static int poolSize = 3000; 
     private static bool isVisualizationRunning = false;
     
     private static string additionalDebugInfo = "";
@@ -71,24 +82,6 @@ public class Plugin : BaseUnityPlugin
     Color NonStandable;
     static int totalCalls = 0;
 
-    /*
-     * Yield thresholds for coroutine execution to prevent frame drops.
-     *
-     * MainYield is used during the preprocessing phase:
-     * - Iterates through the 3D grid and separates positions into [visiblePositions] and [nonVisiblePositions].
-     * - Sorts both lists by distance to the camera.
-     * - This is a lightweight operation and should complete within 5 frames.
-     *
-     * PlaceYield is used during the ball placement phase:
-     * - Processes each position by calling CheckAndPlaceBallAt.
-     * - Prioritizes [visiblePositions] first, then [nonVisiblePositions].
-     * - This is a heavier operation, as it involves a RaycastHit for each of the 35,281 positions.
-     *
-     * The yield values are chosen to balance performance and responsiveness:
-     * - A higher yield value allows more work per frame but increases the risk of frame drops.
-     * - At 120 FPS, the current setting results in less than 5 FPS drop, which is negligible.
-     * - In laggy scenarios (e.g., 20 FPS), the coroutine should still complete in under 2 seconds without noticeable impact.
-     */
 
     private void Awake()
     {
@@ -99,9 +92,9 @@ public class Plugin : BaseUnityPlugin
 
         configScalePercent = Config.Bind("Appearance", "Scale Percent", 100f, new ConfigDescription("How large the standing point indicators are.", new AcceptableValueRange<float>(1f, 200f)));
 
-        configRange = Config.Bind("General", "Detection Range", 10f, new ConfigDescription("How far from the camera the balls are placed. Increasing will heavily affect performance.", new AcceptableValueRange<float>(5f, 28f)));
+        configRange = Config.Bind("General", "Detection Range", 10f, new ConfigDescription("How far from the camera the balls are placed. Increasing will affect performance.", new AcceptableValueRange<float>(5f, 50f)));
 
-        configXZFreq = Config.Bind("General", "Horizontal grid spacing", 0.5f, new ConfigDescription("How far apart the balls are placed horizontally. Reducing will heavily affect performance.", new AcceptableValueRange<float>(0.1f, 2f)));
+        configXZFreq = Config.Bind("General", "Horizontal grid spacing", 0.5f, new ConfigDescription("How far apart the balls are placed horizontally. Reducing will affect performance.", new AcceptableValueRange<float>(0.1f, 2f)));
 
         configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 100, new ConfigDescription("The maximum number of points to place per frame. Higher values reduce fps but make the visualization appear faster.", new AcceptableValueRange<int>(10, 20000)));
 
@@ -115,7 +108,37 @@ public class Plugin : BaseUnityPlugin
             """);
         configDebugMode = Config.Bind("Debug", "Debug Mode", false, "Show debug information");
 
-        Material mat = new(Shader.Find("Universal Render Pipeline/Lit"));
+        string bundlePath = System.IO.Path.Combine(Paths.PluginPath, "Tzebruh-Foothold/Assets/Foothold");
+        var bundle = AssetBundle.LoadFromFile(bundlePath);
+        if (bundle == null)
+        {
+            Logger.LogError("Failed to load AssetBundle");
+            return;
+        }
+
+        // Adjust the asset name to whatever you used
+        Material _instancedMat = bundle.LoadAsset<Material>("Foothold");
+        if (_instancedMat == null)
+        {
+            Logger.LogError("Failed to load instanced material from bundle");
+            return;
+        }
+        else
+        {
+            Logger.LogInfo("Loaded instanced material: " + _instancedMat.name);
+        }
+
+        // Try disabling SRP Batcher to see if that frees up instancing.
+        //GraphicsSettings.useScriptableRenderPipelineBatching = false;
+        //Logger.LogInfo("SRP Batcher disabled by mod");
+
+
+        ballMesh = Resources.GetBuiltinResource<Mesh>("Sphere.fbx");
+
+        Logger.LogInfo($"mesh = {ballMesh}");
+
+        //Material mat = new(Shader.Find("Universal Render Pipeline/Lit Instanced"));
+        Material mat = new(_instancedMat);
         // permanently borrowed from https://discussions.unity.com/t/how-to-make-a-urp-lit-material-semi-transparent-using-script-and-then-set-it-back-to-being-solid/942231/3
         mat.SetFloat("_Surface", 1);
         mat.SetFloat("_Blend", 0);
@@ -129,7 +152,36 @@ public class Plugin : BaseUnityPlugin
         mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
         mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
         mat.renderQueue = (int)RenderQueue.Transparent;
-        baseMaterial = mat;
+        mat.color = Color.white;
+        mat.SetColor("_BaseColor", mat.color);
+        mat.enableInstancing = true;
+        standableMaterial = mat;
+
+        mat = mat = new(_instancedMat);
+        // permanently borrowed from https://discussions.unity.com/t/how-to-make-a-urp-lit-material-semi-transparent-using-script-and-then-set-it-back-to-being-solid/942231/3
+        mat.SetFloat("_Surface", 1);
+        mat.SetFloat("_Blend", 0);
+        mat.SetInt("_IgnoreProjector", 1);           // Ignore projectors (like rain)
+        mat.SetInt("_ReceiveShadows", 0);            // Disable shadow reception
+        mat.SetInt("_ZWrite", 0);                    // Disable z-writing
+        mat.SetInt("_SrcBlend", (int)BlendMode.SrcAlpha);
+        mat.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
+        mat.DisableKeyword("_ALPHATEST_ON");
+        mat.EnableKeyword("_ALPHABLEND_ON");
+        mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+        mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+        mat.renderQueue = (int)RenderQueue.Transparent;
+        mat.color = Color.magenta;
+        mat.SetColor("_BaseColor", mat.color);
+        mat.enableInstancing = true;
+        nonStandableMaterial = mat;
+
+        standableRP = new RenderParams(standableMaterial) {
+            layer = cullingLayer
+        };
+        nonStandableRP = new RenderParams(nonStandableMaterial) {
+            layer = cullingLayer
+        };
 
         SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -143,6 +195,10 @@ public class Plugin : BaseUnityPlugin
         configScalePercent.SettingChanged += Color_SettingChanged;
 
 
+        standableMatrices.Add(new Matrix4x4[500]);
+        linkedStandableMatrices.Add(new PositionKey[500]);
+        nonStandableMatrices.Add(new Matrix4x4[500]);
+        linkedNonStandableMatrices.Add(new PositionKey[500]);
 
 
         Logger.LogInfo($"Loaded Foothold? version {MyPluginInfo.PLUGIN_VERSION}");
@@ -150,30 +206,17 @@ public class Plugin : BaseUnityPlugin
 
     private void ConfigMode_SettingChanged(object sender, EventArgs e)
     {
-        ReturnAllBallsToPool();
-
         if (configMode.Value != Mode.FadeAway)
         {
-            foreach (var ball in pool_balls)
-            {
-                if (ball != null)
-                {
-                    Material mat = ball.GetComponent<Renderer>().material;
-                    Color baseColor = mat.GetColor("_BaseColor");
-                    baseColor.a = alpha;
-                    mat.SetColor("_BaseColor", baseColor);
-                }
-            }
-            foreach (var ball in pool_redBalls)
-            {
-                if (ball != null)
-                {
-                    Material mat = ball.GetComponent<Renderer>().material;
-                    Color baseColor = mat.GetColor("_BaseColor");
-                    baseColor.a = alpha;
-                    mat.SetColor("_BaseColor", baseColor);
-                }
-            }
+            Color baseColor = standableMaterial.GetColor("_BaseColor");
+            baseColor.a = alpha;
+            standableMaterial.SetColor("_BaseColor", baseColor);
+            standableRP.material = standableMaterial;
+            
+            baseColor = nonStandableMaterial.GetColor("_BaseColor");
+            baseColor.a = alpha;
+            nonStandableMaterial.SetColor("_BaseColor", baseColor);
+            nonStandableRP.material = nonStandableMaterial;
         }
     }
 
@@ -191,6 +234,7 @@ public class Plugin : BaseUnityPlugin
             safeRange = (int)Mathf.Round(range * 10f);
             maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
             scalePercent = configScalePercent.Value / 100f;
+            scale = Vector3.one / 10 * scalePercent;
 
             if (configStandableBallColor.Value == StandableColor.Green)
             {
@@ -220,25 +264,20 @@ public class Plugin : BaseUnityPlugin
                 nearestGridToCamera.z = 0;
             }
 
-            poolSize = (int)((2 * range / freq) * (2 * range / freq)); // adjust pool size based on range and frequency
 
             if (LastStandableColor != standable)
             {
-                pool_balls.Clear();
-                for (int i = 0; i < poolSize; i++)
-                {
-                    pool_balls.Enqueue(CreateBall(standable));
-                }
+                standableMaterial.color = standable;
+                standableMaterial.SetColor("_BaseColor", standable);
+                standableRP.material = standableMaterial;
                 LastStandableColor = standable;
             }
 
             if (LastNonStandableColor != NonStandable)
             {
-                pool_redBalls.Clear();
-                for (int i = 0; i < poolSize; i++)
-                {
-                    pool_redBalls.Enqueue(CreateBall(NonStandable));
-                }
+                nonStandableMaterial.color = NonStandable;
+                nonStandableMaterial.SetColor("_BaseColor", NonStandable);
+                nonStandableRP.material = nonStandableMaterial;
                 LastNonStandableColor = NonStandable;
             }
         }
@@ -253,16 +292,13 @@ public class Plugin : BaseUnityPlugin
 
         int count = 0;
         int ballCount = 0;
+
+        ballCount = nextFreeStandableMatrixIndex.Item1 * 500 + nextFreeStandableMatrixIndex.Item2;
+        ballCount += nextFreeNonStandableMatrixIndex.Item1 * 500 + nextFreeNonStandableMatrixIndex.Item2;
+
         foreach (var yDict in positionCache.Values)
         {
             count += yDict.list.Count;
-            foreach (var pk in yDict.list.Values)
-            {
-                if (pk != null && pk.ballObject != null)
-                {
-                    ballCount++;
-                }
-            }
         }
 
         if (count > highestCount)
@@ -291,8 +327,6 @@ public class Plugin : BaseUnityPlugin
         GUILayout.Label("Camera Position: " + focalReferencePoint.ToString("F2"));
         GUILayout.Label("balls: " + ballCount);
         GUILayout.Label("highestBallCount: " + highestBallCount);
-        GUILayout.Label("pool_balls: " + pool_balls.Count);
-        GUILayout.Label("pool_redBalls: " + pool_redBalls.Count);
         GUILayout.Label("positionCache (x/z count): " + positionCache.Count);
 
 
@@ -322,10 +356,18 @@ public class Plugin : BaseUnityPlugin
         // Checking for mainCamera in update because it PROBABLY spawns after scene load for networking reasons but this is a complete guess
 
         ReturnAllBallsToPool();
-        
-        pool_balls.Clear();
-        pool_redBalls.Clear();
         positionCache.Clear();
+
+        standableMatrices.Clear();
+        linkedStandableMatrices.Clear();
+        nonStandableMatrices.Clear();
+        linkedNonStandableMatrices.Clear();
+
+
+        standableMatrices.Add(new Matrix4x4[500]);
+        linkedStandableMatrices.Add(new PositionKey[500]);
+        nonStandableMatrices.Add(new Matrix4x4[500]);
+        linkedNonStandableMatrices.Add(new PositionKey[500]);
 
 
         freq = configXZFreq.Value;
@@ -334,6 +376,7 @@ public class Plugin : BaseUnityPlugin
         safeRange = (int)Mathf.Round(range * 10f);
         maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
         scalePercent = configScalePercent.Value / 100f;
+        scale = Vector3.one / 10 * scalePercent;
 
 
         nearestGridToCamera.x = 0;
@@ -365,28 +408,14 @@ public class Plugin : BaseUnityPlugin
             LastStandableColor = standable;
             LastNonStandableColor = NonStandable;
 
-            poolSize = (int)((2 * range / freq) * (2 * range / freq)); // adjust pool size based on range and frequency
+            standableMaterial.color = standable;
+            standableMaterial.SetColor("_BaseColor", standable);
+            standableRP.material = standableMaterial;
 
-            for (int i = 0; i < poolSize; i++)
-            {
-                pool_balls.Enqueue(CreateBall(standable));
-                pool_redBalls.Enqueue(CreateBall(NonStandable));
-            }
+            nonStandableMaterial.color = NonStandable;
+            nonStandableMaterial.SetColor("_BaseColor", NonStandable);
+            nonStandableRP.material = nonStandableMaterial;
         }
-    }
-
-    private GameObject CreateBall(Color ballColor)
-    {
-        GameObject ball = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        Destroy(ball.GetComponent<Collider>());
-        ball.GetComponent<Renderer>().material = new(baseMaterial);
-        ball.GetComponent<Renderer>().shadowCastingMode = ShadowCastingMode.Off;
-        ball.GetComponent<Renderer>().receiveShadows = false;
-        ball.GetComponent<Renderer>().material.SetColor("_BaseColor", ballColor);
-        ball.transform.localScale = Vector3.one / 5 * scalePercent;
-        ball.transform.position = Vector3.zero + Vector3.down * 5000f;
-        ball.SetActive(true);
-        return ball;
     }
 
     private void Update()
@@ -398,6 +427,11 @@ public class Plugin : BaseUnityPlugin
                 mainCamera = FindFirstObjectByType<MainCamera>()?.GetComponent<Camera>();
                 return;
             }
+
+            if (Camera.main == null) return;    
+
+            standableRP.camera = Camera.main;
+            nonStandableRP.camera = mainCamera;
 
             if (!isVisualizationRunning)
             {
@@ -422,8 +456,37 @@ public class Plugin : BaseUnityPlugin
                     StartCoroutine(RenderChangedVisualizationCoroutine());
                 }
             }
+
             CheckHotkeys();
             if (configMode.Value == Mode.FadeAway) SetBallAlphas();
+
+            try
+            {
+                for (int i = 0; i < standableMatrices.Count; i++)
+                {
+                    if (standableMatrices[i] == null) continue;
+                    if (standableMatrices[i].Length == 0) continue;
+                    if (i > nextFreeStandableMatrixIndex.Item1 || (i == nextFreeStandableMatrixIndex.Item1 && nextFreeStandableMatrixIndex.Item2 == 0))
+                    {
+                        break;
+                    }   
+                    Graphics.RenderMeshInstanced(standableRP, ballMesh, 0, standableMatrices[i]);
+                }
+                for (int i = 0; i < nonStandableMatrices.Count; i++)
+                {
+                    if (nonStandableMatrices[i] == null) continue;
+                    if (nonStandableMatrices[i].Length == 0) continue;
+                    if (i > nextFreeNonStandableMatrixIndex.Item1 || (i == nextFreeNonStandableMatrixIndex.Item1 && nextFreeNonStandableMatrixIndex.Item2 == 0))
+                    {
+                        break;
+                    }   
+                    Graphics.RenderMeshInstanced(nonStandableRP, ballMesh, 0, nonStandableMatrices[i]);
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogError(e);
+            }
         }
     }
 
@@ -437,6 +500,8 @@ public class Plugin : BaseUnityPlugin
             {
                 continuousPaused = !continuousPaused;
 
+                /*
+
                 if (continuousPaused)
                 {
                     ReturnAllBallsToPool();
@@ -448,6 +513,7 @@ public class Plugin : BaseUnityPlugin
                     nearestGridToCamera.y = 0;
                     nearestGridToCamera.z = 0;
                 }
+                */
 
                 // just abuse the gem message for now to indicate if we're paused or not for testing purposes
                 if (GlobalEvents.OnGemActivated != null)
@@ -490,56 +556,119 @@ public class Plugin : BaseUnityPlugin
 
     private static void ReturnBallToPool(PositionKey ball)
     {
-        if (ball.ballObject != null)
+        if (!ball.ballVisible || ball.ballMatrixIndex.Item1 < 0 || ball.ballMatrixIndex.Item2 < 0) 
         {
-            ball.ballObject.SetActive(false);
-            totalCalls++;
-            if (ball.standable)
-            {
-                pool_balls.Enqueue(ball.ballObject);
-            }
-            else
-            {
-                pool_redBalls.Enqueue(ball.ballObject);
-            }
-            ball.ballObject = null;
+            ball.ballVisible = false;
+            ball.ballMatrixIndex.Item1 = -1;
+            ball.ballMatrixIndex.Item2 = -1;
+            return;
         }
+
+        Matrix4x4 previousLastEntry = Matrix4x4.zero;
+        PositionKey previousLastPositionKey = null;
+
+        if (ball.standable)
+        {
+            nextFreeStandableMatrixIndex.Item2 -= 1;
+            if (nextFreeStandableMatrixIndex.Item2 < 0)
+            {
+                nextFreeStandableMatrixIndex.Item1 -= 1;
+                nextFreeStandableMatrixIndex.Item2 = 499;
+            }
+            if (nextFreeStandableMatrixIndex.Item1 >= 0 && nextFreeStandableMatrixIndex.Item2 >= 0)
+            {
+                previousLastEntry = standableMatrices[nextFreeStandableMatrixIndex.Item1][nextFreeStandableMatrixIndex.Item2];
+                previousLastPositionKey = linkedStandableMatrices[nextFreeStandableMatrixIndex.Item1][nextFreeStandableMatrixIndex.Item2];
+                standableMatrices[ball.ballMatrixIndex.Item1][ball.ballMatrixIndex.Item2] = previousLastEntry;
+                linkedStandableMatrices[ball.ballMatrixIndex.Item1][ball.ballMatrixIndex.Item2] = previousLastPositionKey;
+                previousLastPositionKey.ballMatrixIndex = (ball.ballMatrixIndex.Item1, ball.ballMatrixIndex.Item2);
+            }
+            if (nextFreeStandableMatrixIndex.Item1 < 0)
+            {
+                nextFreeStandableMatrixIndex.Item1 = 0;
+                nextFreeStandableMatrixIndex.Item2 = 0;
+                standableMatrices[nextFreeStandableMatrixIndex.Item1][nextFreeStandableMatrixIndex.Item2] = Matrix4x4.zero;
+            }
+        }
+        else
+        {
+            nextFreeNonStandableMatrixIndex.Item2 -= 1;
+            if (nextFreeNonStandableMatrixIndex.Item2 < 0)
+            {
+                nextFreeNonStandableMatrixIndex.Item1 -= 1;
+                nextFreeNonStandableMatrixIndex.Item2 = 499;
+            }
+            if (nextFreeNonStandableMatrixIndex.Item1 >= 0 && nextFreeNonStandableMatrixIndex.Item2 >= 0)
+            {   
+                previousLastEntry = nonStandableMatrices[nextFreeNonStandableMatrixIndex.Item1][nextFreeNonStandableMatrixIndex.Item2];
+                previousLastPositionKey = linkedNonStandableMatrices[nextFreeNonStandableMatrixIndex.Item1][nextFreeNonStandableMatrixIndex.Item2];
+                nonStandableMatrices[ball.ballMatrixIndex.Item1][ball.ballMatrixIndex.Item2] = previousLastEntry;
+                linkedNonStandableMatrices[ball.ballMatrixIndex.Item1][ball.ballMatrixIndex.Item2] = previousLastPositionKey;
+                previousLastPositionKey.ballMatrixIndex = (ball.ballMatrixIndex.Item1, ball.ballMatrixIndex.Item2);
+                nonStandableMatrices[nextFreeNonStandableMatrixIndex.Item1][nextFreeNonStandableMatrixIndex.Item2] = Matrix4x4.zero;
+            }
+            if (nextFreeNonStandableMatrixIndex.Item1 < 0)
+            {
+                nextFreeNonStandableMatrixIndex.Item1 = 0;
+                nextFreeNonStandableMatrixIndex.Item2 = 0;
+                nonStandableMatrices[nextFreeNonStandableMatrixIndex.Item1][nextFreeNonStandableMatrixIndex.Item2] = Matrix4x4.zero;
+            }
+        }
+
+        ball.ballVisible = false;
+        ball.ballMatrixIndex.Item1 = -1;
+        ball.ballMatrixIndex.Item2 = -1;
+    
+        totalCalls++;
     }
 
 
     private void PlaceBall(PositionKey positionKey)
     {
-        GameObject ball = null;
+        if (positionKey.ballVisible) return;
+
+        Matrix4x4 position = Matrix4x4.TRS(positionKey.position, Quaternion.identity, scale);
+        positionKey.matrix = position;
+        positionKey.ballVisible = true;
+
 
         if (positionKey.standable)
         {
-            if (pool_balls.Count == 0)
+            standableMatrices[nextFreeStandableMatrixIndex.Item1][nextFreeStandableMatrixIndex.Item2] = position;
+            linkedStandableMatrices[nextFreeStandableMatrixIndex.Item1][nextFreeStandableMatrixIndex.Item2] = positionKey;
+            positionKey.ballMatrixIndex = (nextFreeStandableMatrixIndex.Item1, nextFreeStandableMatrixIndex.Item2);
+
+            nextFreeStandableMatrixIndex.Item2++;
+            if (nextFreeStandableMatrixIndex.Item2 >= 500)
             {
-                for (int i = 0; i < poolSize / 10; i++)
+                nextFreeStandableMatrixIndex.Item1++;
+                nextFreeStandableMatrixIndex.Item2 = 0;
+                if (standableMatrices.Count <= nextFreeStandableMatrixIndex.Item1)
                 {
-                    pool_balls.Enqueue(CreateBall(standable));
-                    totalCalls++;
+                    standableMatrices.Add(new Matrix4x4[500]);
+                    linkedStandableMatrices.Add(new PositionKey[500]);
                 }
             }
-            ball = pool_balls.Dequeue();
         }
         else
         {
-            if (pool_redBalls.Count == 0)
+            nonStandableMatrices[nextFreeNonStandableMatrixIndex.Item1][nextFreeNonStandableMatrixIndex.Item2] = position;
+            linkedNonStandableMatrices[nextFreeNonStandableMatrixIndex.Item1][nextFreeNonStandableMatrixIndex.Item2] = positionKey;
+            positionKey.ballMatrixIndex = (nextFreeNonStandableMatrixIndex.Item1, nextFreeNonStandableMatrixIndex.Item2);
+
+            nextFreeNonStandableMatrixIndex.Item2++;
+            if (nextFreeNonStandableMatrixIndex.Item2 >= 500)
             {
-                for (int i = 0; i < poolSize / 10; i++)
+                nextFreeNonStandableMatrixIndex.Item1++;
+                nextFreeNonStandableMatrixIndex.Item2 = 0;
+                if (nonStandableMatrices.Count <= nextFreeNonStandableMatrixIndex.Item1)
                 {
-                    pool_redBalls.Enqueue(CreateBall(NonStandable));
-                    totalCalls++;
+                    nonStandableMatrices.Add(new Matrix4x4[500]);
+                    linkedNonStandableMatrices.Add(new PositionKey[500]);
                 }
             }
-            ball = pool_redBalls.Dequeue();
         }
-
-        ball.transform.position = positionKey.position;
-        positionKey.ballObject = ball;
-        ball.SetActive(true);
-
+        
         totalCalls++;
     }
 
@@ -611,10 +740,12 @@ public class Plugin : BaseUnityPlugin
         Rect newCacheKeepArea = Rect.MinMaxRect(nearestGridToCamera.x - safeRange*2, nearestGridToCamera.z - safeRange*2, nearestGridToCamera.x + safeRange*2, nearestGridToCamera.z + safeRange*2);
         Rect recheckArea = Rect.MinMaxRect(minX, minZ, maxX, maxZ);
 
+        
+
         var newAreas = SubtractRect(newArea, oldArea);
         var expiredCacheKeepAreas = SubtractRect(oldCacheKeepArea, newCacheKeepArea);
         var expiredRecheckAreas = SubtractRect(oldRecheckArea, recheckArea);
-        var newRecheckAreas = SubtractRect(recheckArea, oldRecheckArea);
+        //var newRecheckAreas = SubtractRect(recheckArea, oldRecheckArea);
 
         PositionYList pCache = null;
 
@@ -673,7 +804,7 @@ public class Plugin : BaseUnityPlugin
                 {
                     try
                     {
-                        RemoveBallsInVerticalRay(x, z);
+                        RemoveBallsInVerticalRay(x, z, true);
                     }
                     catch (Exception e)
                     {
@@ -729,17 +860,31 @@ public class Plugin : BaseUnityPlugin
                 cameraFrustum.PrepX(x / 10f);
                 for (int z = (int)Mathf.Round(area.yMin); z <= ayMax; z += safeFreq)
                 {
-                    cameraFrustum.PrepXZ(z / 10f);
-                
-                    pCache = CheckCacheMiss(x, nearestGridToCamera.y, z);
+                    try
+                    {
+                        cameraFrustum.PrepXZ(z / 10f);
                     
+                        pCache = CheckCacheMiss(x, nearestGridToCamera.y, z);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
+
                     if (totalCalls >= maximumRaysPerFrame)
                     {
                         totalCalls = 0;
                         yield return null;
                     }
                 
-                    PlaceBallsInVerticalRay(pCache, nearestGridToCamera.y, true);
+                    try
+                    {
+                        PlaceBallsInVerticalRay(pCache, nearestGridToCamera.y, true);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError(e);
+                    }
 
                     if (totalCalls >= maximumRaysPerFrame)
                     {
@@ -905,11 +1050,11 @@ public class Plugin : BaseUnityPlugin
                     inFrustum = yDist <= range;
                 }
 
-                if (cachedKey.ballObject == null && inFrustum)
+                if (!cachedKey.ballVisible && inFrustum)
                 {
                     PlaceBall(cachedKey);
                 }
-                else if (cachedKey.ballObject != null && !inFrustum)
+                else if (cachedKey.ballVisible && !inFrustum)
                 {
                     ReturnBallToPool(cachedKey);
                 }
@@ -923,7 +1068,7 @@ public class Plugin : BaseUnityPlugin
         {
             if (expireCache)
             {
-                positionCache.Remove((xIndex, zIndex)); // clear cache for this vertical line. Consider keeping it for a certain larger radius?
+                positionCache.Remove((xIndex, zIndex)); // clear cache for this vertical line
                 yDict.ReturnToPool();
             }
             else
@@ -1010,20 +1155,17 @@ public class Plugin : BaseUnityPlugin
 
         alpha = Mathf.Lerp(1f, 0f, Mathf.Clamp01((Time.time - (lastScanTime + 3)) / 3));
 
-        foreach (var pkc in positionCache.Values)
-        {
-            foreach (var ball in pkc.list.Values)
-            {
-                if (ball != null)
-                {
-                    if (ball.ballObject == null) continue;
-                    Material mat = ball.ballObject.GetComponent<Renderer>().material;
-                    Color baseColor = mat.GetColor("_BaseColor");
-                    baseColor.a = alpha;
-                    mat.SetColor("_BaseColor", baseColor);
-                }
-            }
-        }
+
+        Color baseColor = standableMaterial.GetColor("_BaseColor");
+        baseColor.a = alpha;
+        standableMaterial.SetColor("_BaseColor", baseColor);
+        standableRP.material = standableMaterial;
+        
+        baseColor = nonStandableMaterial.GetColor("_BaseColor");
+        baseColor.a = alpha;
+        nonStandableMaterial.SetColor("_BaseColor", baseColor);
+        nonStandableRP.material = nonStandableMaterial;
+        
 
         if (alpha <= 0)
         {
@@ -1065,7 +1207,9 @@ public class Plugin : BaseUnityPlugin
 
         public Vector3 position;
         public bool standable;
-        public GameObject ballObject;
+        public Matrix4x4 matrix;
+        public bool ballVisible = false;
+        public (int, int) ballMatrixIndex = (-1, -1);
 
         
         static PositionKey()
@@ -1095,8 +1239,9 @@ public class Plugin : BaseUnityPlugin
             }
             PositionKey drop = pool.Dequeue();
             drop.position = new Vector3(x, y, z);
+            drop.matrix = Matrix4x4.TRS(drop.position, Quaternion.identity, scale);
             drop.standable = standable;
-            drop.ballObject = ballObject;
+            drop.ballVisible = false;
             drop.isInUse = true;
             totalInUse++;
             return drop;
@@ -1115,8 +1260,9 @@ public class Plugin : BaseUnityPlugin
             }
             PositionKey drop = pool.Dequeue();
             drop.position = position;
+            drop.matrix = Matrix4x4.TRS(drop.position, Quaternion.identity, scale);
             drop.standable = standable;
-            drop.ballObject = ballObject;
+            drop.ballVisible = false;
             drop.isInUse = true;
             totalInUse++;
             return drop;
@@ -1129,7 +1275,7 @@ public class Plugin : BaseUnityPlugin
             ReturnBallToPool(this);
             position = Vector3.zero;
             standable = false;
-            ballObject = null;
+            ballVisible = false;
             isInUse = false;
             pool.Enqueue(this);
             totalInUse--;
@@ -1316,11 +1462,10 @@ public class Plugin : BaseUnityPlugin
         public (int, int, int, int) GetFrequencyQuantizedXZFrustumBounds(float freq)
         {
             var (minX, maxX, minZ, maxZ) = GetXZFrustumBounds();
-
-            int qMinX = (int)Mathf.Floor(Mathf.Floor(minX / freq) * freq * 10f);
-            int qMaxX = (int)Mathf.Ceil(Mathf.Ceil(maxX / freq) * freq * 10f);
-            int qMinZ = (int)Mathf.Floor(Mathf.Floor(minZ / freq) * freq * 10f);
-            int qMaxZ = (int)Mathf.Ceil(Mathf.Ceil(maxZ / freq) * freq * 10f);
+            int qMinX = (int)Mathf.Round(Mathf.Round(minX / freq) * freq * 10f);
+            int qMaxX = (int)Mathf.Round(Mathf.Round(maxX / freq) * freq * 10f);
+            int qMinZ = (int)Mathf.Round(Mathf.Round(minZ / freq) * freq * 10f);
+            int qMaxZ = (int)Mathf.Round(Mathf.Round(maxZ / freq) * freq * 10f);
 
             return (qMinX, qMaxX, qMinZ, qMaxZ);
         }
