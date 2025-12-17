@@ -3,7 +3,12 @@ To assemble the Thunderstore package, zip these files:
 icon.png - From <repo>/thunderstore/
 LICENSE - From <repo>/
 manifest.json - From <repo>/thunderstore/
+Assets/ - From <repo>/thunderstore/
 README.md - From <repo>/
 Foothold.dll - From <repo>/bin/Debug/netstandard2.1/
 
 <repo>/thunderstore/*.zip is gitignored, so the zip file should be <repo>/thunderstore/Tzebruh-Foothold-<version>.zip
+
+
+If you compile a new version of the assetbundle, copy:
+foothold - from <repo>/foothold assetbundle project/Assets/ModBundles/ - to <repo>/thunderstore/Assets/
