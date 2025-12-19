@@ -111,7 +111,7 @@ public class Plugin : BaseUnityPlugin
 
         configXZFreq = Config.Bind("General", "Horizontal grid spacing", 0.5f, new ConfigDescription("How far apart the balls are placed horizontally. Reducing will affect performance.", new AcceptableValueRange<float>(0.1f, 2f)));
 
-        configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 1000, new ConfigDescription("The maximum number of raycasts to do per frame to check for standing spots. Higher values reduce fps but make the visualization appear faster.", new AcceptableValueRange<int>(10, 20000)));
+        configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 100, new ConfigDescription("The maximum number of raycasts to do per frame to check for standing spots. Higher values reduce fps but make the visualization appear faster.", new AcceptableValueRange<int>(10, 20000)));
 
         configDetectConcave = Config.Bind("General", "Detect Concave Points", true, "Detecting standing spots on concave meshes takes many extra raycasts. Disabling won't show these standing spots, but will improve performance. Remember to increase 'Maximum points per frame' by about 10x if you enable this (1000+ at least - New default assumes this is enabled).");
 
@@ -256,7 +256,7 @@ public class Plugin : BaseUnityPlugin
             safeFreq = (int)Mathf.Round(freq * 10f);
             range = Mathf.Round(configRange.Value / freq) * freq; // range needs to be a multiple of frequency for the grid to step properly
             safeRange = (int)Mathf.Round(range * 10f);
-            maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
+            maximumRaysPerFrame = configMaximumPointsPerFrame.Value * 10;
             scalePercent = configScalePercent.Value / 100f;
             scale = Vector3.one / 10 * scalePercent;
             baseAlpha = configAlpha.Value / 100f;
@@ -406,7 +406,7 @@ public class Plugin : BaseUnityPlugin
         safeFreq = (int)Mathf.Round(freq * 10f);
         range = Mathf.Round(configRange.Value / freq) * freq; // range needs to be a multiple of frequency for the grid to step properly
         safeRange = (int)Mathf.Round(range * 10f);
-        maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
+        maximumRaysPerFrame = configMaximumPointsPerFrame.Value * 10;
         scalePercent = configScalePercent.Value / 100f;
         scale = Vector3.one / 10 * scalePercent;
         baseAlpha = configAlpha.Value / 100f;
