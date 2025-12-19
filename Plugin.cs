@@ -1472,6 +1472,10 @@ public class Plugin : BaseUnityPlugin
         public float near;
         public float far;
 
+        public float nearSqr;
+        public float farSqr;
+
+
         public float tanHalfVertFov;
         public float tanHalfHorFov;
 
@@ -1486,6 +1490,9 @@ public class Plugin : BaseUnityPlugin
 
             near = cam.nearClipPlane;
             far  = cam.farClipPlane;
+
+            nearSqr = near * near;
+            farSqr  = far * far;
 
             if (farClipPlaneOverride > 0f)
             {
@@ -1549,7 +1556,7 @@ public class Plugin : BaseUnityPlugin
 
             // True pythagoras distance from camera
             float distSqr = XZPrepDistance + (pointY * pointY);
-            if (distSqr < near * near || distSqr > far * far)
+            if (distSqr < nearSqr || distSqr > farSqr)
                 return false;
 
             return true;
@@ -1577,7 +1584,7 @@ public class Plugin : BaseUnityPlugin
 
             // True pythagoras distance from camera
             float distSqr = v.sqrMagnitude;
-            if (distSqr < near * near || distSqr > far * far)
+            if (distSqr < nearSqr || distSqr > farSqr)
                 return false;
 
             return true;
