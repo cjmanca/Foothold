@@ -38,7 +38,8 @@ public class Plugin : BaseUnityPlugin
     static RenderParams nonStandableRP;
     internal static Material standableMaterial;
     internal static Material nonStandableMaterial;
-    internal static float alpha = 1;
+    internal static float alpha = 0.25f;
+    internal static float baseAlpha = 0.25f;
     internal static bool continuousPaused = false;
 
     private static readonly Dictionary<(int, int), PositionYList> positionCache = new();
@@ -54,6 +55,7 @@ public class Plugin : BaseUnityPlugin
     private ConfigEntry<StandableColor> configStandableBallColor;
     private ConfigEntry<NonStandableColor> configNonStandableBallColor;
     private ConfigEntry<float> configScalePercent;
+    private ConfigEntry<float> configAlpha;
     private ConfigEntry<float> configRange;
 
     private ConfigEntry<float> configXZFreq;
@@ -89,6 +91,8 @@ public class Plugin : BaseUnityPlugin
 
         configStandableBallColor = Config.Bind("Appearance", "Standable ground Color", StandableColor.White, "Change the ball color of standable ground.");
         configNonStandableBallColor = Config.Bind("Appearance", "Non-standable ground Color", NonStandableColor.Red, "Change the ball color of non-standable ground.");
+        configAlpha = Config.Bind("Appearance", "Transparency Percent", 100f, new ConfigDescription("How transparent the balls are.", new AcceptableValueRange<float>(1f, 100f)));
+
 
         configScalePercent = Config.Bind("Appearance", "Scale Percent", 100f, new ConfigDescription("How large the standing point indicators are.", new AcceptableValueRange<float>(1f, 200f)));
 
@@ -108,7 +112,7 @@ public class Plugin : BaseUnityPlugin
             """);
         configDebugMode = Config.Bind("Debug", "Debug Mode", false, "Show debug information");
 
-        string bundlePath = System.IO.Path.Combine(Paths.PluginPath, "Tzebruh-Foothold/Assets/Foothold");
+        string bundlePath = System.IO.Path.Combine(Paths.PluginPath, "Tzebruh-Foothold/Foothold");
         var bundle = AssetBundle.LoadFromFile(bundlePath);
         if (bundle == null)
         {
@@ -140,6 +144,7 @@ public class Plugin : BaseUnityPlugin
         //Material mat = new(Shader.Find("Universal Render Pipeline/Lit Instanced"));
         Material mat = new(_instancedMat);
         // permanently borrowed from https://discussions.unity.com/t/how-to-make-a-urp-lit-material-semi-transparent-using-script-and-then-set-it-back-to-being-solid/942231/3
+        
         mat.SetFloat("_Surface", 1);
         mat.SetFloat("_Blend", 0);
         mat.SetInt("_IgnoreProjector", 1);           // Ignore projectors (like rain)
@@ -149,11 +154,16 @@ public class Plugin : BaseUnityPlugin
         mat.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
         mat.DisableKeyword("_ALPHATEST_ON");
         mat.EnableKeyword("_ALPHABLEND_ON");
-        mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
         mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
         mat.renderQueue = (int)RenderQueue.Transparent;
-        mat.color = Color.white;
-        mat.SetColor("_BaseColor", mat.color);
+        mat.enableInstancing = true;
+    
+        Color c = Color.white;
+        c.a = baseAlpha;
+
+        mat.color = c;
+        mat.SetColor("_BaseColor", c);
+        /**/
         mat.enableInstancing = true;
         standableMaterial = mat;
 
@@ -168,11 +178,15 @@ public class Plugin : BaseUnityPlugin
         mat.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
         mat.DisableKeyword("_ALPHATEST_ON");
         mat.EnableKeyword("_ALPHABLEND_ON");
-        mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
         mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
         mat.renderQueue = (int)RenderQueue.Transparent;
-        mat.color = Color.magenta;
-        mat.SetColor("_BaseColor", mat.color);
+
+        c = Color.magenta;
+        c.a = baseAlpha;
+
+        mat.color = c;
+        mat.SetColor("_BaseColor", c);
+        /**/
         mat.enableInstancing = true;
         nonStandableMaterial = mat;
 
@@ -209,12 +223,12 @@ public class Plugin : BaseUnityPlugin
         if (configMode.Value != Mode.FadeAway)
         {
             Color baseColor = standableMaterial.GetColor("_BaseColor");
-            baseColor.a = alpha;
+            baseColor.a = baseAlpha;
             standableMaterial.SetColor("_BaseColor", baseColor);
             standableRP.material = standableMaterial;
             
             baseColor = nonStandableMaterial.GetColor("_BaseColor");
-            baseColor.a = alpha;
+            baseColor.a = baseAlpha;
             nonStandableMaterial.SetColor("_BaseColor", baseColor);
             nonStandableRP.material = nonStandableMaterial;
         }
@@ -235,6 +249,8 @@ public class Plugin : BaseUnityPlugin
             maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
             scalePercent = configScalePercent.Value / 100f;
             scale = Vector3.one / 10 * scalePercent;
+            baseAlpha = configAlpha.Value / 100f;
+
 
             if (configStandableBallColor.Value == StandableColor.Green)
             {
@@ -267,16 +283,20 @@ public class Plugin : BaseUnityPlugin
 
             if (LastStandableColor != standable)
             {
-                standableMaterial.color = standable;
-                standableMaterial.SetColor("_BaseColor", standable);
+                Color c = standable;
+                c.a = baseAlpha;
+                standableMaterial.color = c;
+                standableMaterial.SetColor("_BaseColor", c);
                 standableRP.material = standableMaterial;
                 LastStandableColor = standable;
             }
 
             if (LastNonStandableColor != NonStandable)
             {
-                nonStandableMaterial.color = NonStandable;
-                nonStandableMaterial.SetColor("_BaseColor", NonStandable);
+                Color c = NonStandable;
+                c.a = baseAlpha;
+                nonStandableMaterial.color = c;
+                nonStandableMaterial.SetColor("_BaseColor", c);
                 nonStandableRP.material = nonStandableMaterial;
                 LastNonStandableColor = NonStandable;
             }
@@ -377,6 +397,7 @@ public class Plugin : BaseUnityPlugin
         maximumRaysPerFrame = configMaximumPointsPerFrame.Value;
         scalePercent = configScalePercent.Value / 100f;
         scale = Vector3.one / 10 * scalePercent;
+        baseAlpha = configAlpha.Value / 100f;
 
 
         nearestGridToCamera.x = 0;
@@ -407,13 +428,19 @@ public class Plugin : BaseUnityPlugin
 
             LastStandableColor = standable;
             LastNonStandableColor = NonStandable;
+        
+            Color c = standable;
+            c.a = baseAlpha;
 
-            standableMaterial.color = standable;
-            standableMaterial.SetColor("_BaseColor", standable);
+            standableMaterial.color = c;
+            standableMaterial.SetColor("_BaseColor", c);
             standableRP.material = standableMaterial;
 
-            nonStandableMaterial.color = NonStandable;
-            nonStandableMaterial.SetColor("_BaseColor", NonStandable);
+            c = NonStandable;
+            c.a = baseAlpha;
+
+            nonStandableMaterial.color = c;
+            nonStandableMaterial.SetColor("_BaseColor", c);
             nonStandableRP.material = nonStandableMaterial;
         }
     }
@@ -618,8 +645,6 @@ public class Plugin : BaseUnityPlugin
         ball.ballVisible = false;
         ball.ballMatrixIndex.Item1 = -1;
         ball.ballMatrixIndex.Item2 = -1;
-    
-        totalCalls++;
     }
 
 
@@ -668,8 +693,6 @@ public class Plugin : BaseUnityPlugin
                 }
             }
         }
-        
-        totalCalls++;
     }
 
     private IEnumerator RenderVisualizationCoroutine()
@@ -1107,13 +1130,13 @@ public class Plugin : BaseUnityPlugin
 
             int hitcount = Physics.RaycastNonAlloc(from, Vector3.down, _terrainHitBuffer, range * 3f, HelperFunctions.GetMask(HelperFunctions.LayerType.TerrainMap), QueryTriggerInteraction.UseGlobal);
 
-            totalCalls++;
-
             pCache.rayTop = from.y;
             pCache.rayBottom = from.y - range * 3f;
 
             for (int i = 0; i < hitcount; i++)
             {
+                totalCalls++;
+
                 RaycastHit raycastHit = _terrainHitBuffer[i];
 
                 if (!raycastHit.transform) continue;
@@ -1153,7 +1176,7 @@ public class Plugin : BaseUnityPlugin
         if (Time.time - lastAlphaChangeTime < 0.05) return;
         lastAlphaChangeTime = Time.time;
 
-        alpha = Mathf.Lerp(1f, 0f, Mathf.Clamp01((Time.time - (lastScanTime + 3)) / 3));
+        alpha = Mathf.Lerp(baseAlpha, 0f, Mathf.Clamp01((Time.time - (lastScanTime + 3)) / 3));
 
 
         Color baseColor = standableMaterial.GetColor("_BaseColor");
