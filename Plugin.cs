@@ -10,6 +10,7 @@ using System.Security.Cryptography.X509Certificates;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
+using UnityEngine.UIElements;
 
 namespace Foothold;
 
@@ -41,6 +42,7 @@ public class Plugin : BaseUnityPlugin
     internal static float alpha = 0.25f;
     internal static float baseAlpha = 0.25f;
     internal static bool continuousPaused = false;
+    internal static bool continuousPauseToggleQueued = false;
 
     private static readonly Dictionary<(int, int), PositionYList> positionCache = new();
     
@@ -60,6 +62,7 @@ public class Plugin : BaseUnityPlugin
 
     private ConfigEntry<float> configXZFreq;
     private ConfigEntry<int> configMaximumPointsPerFrame;
+    private ConfigEntry<bool> configDetectConcave;
 
     private static SafeXZ nearestGridToCamera; // nearest grid point to camera position, updated each frame
     // This allows caching of grid positions instead of recalculating each time
@@ -69,6 +72,7 @@ public class Plugin : BaseUnityPlugin
     private static float range;
     private static int safeRange;
     private static int maximumRaysPerFrame;
+    private static bool detectConcave;
 
 
 
@@ -89,6 +93,13 @@ public class Plugin : BaseUnityPlugin
     {
         Logger = base.Logger;
 
+        configMode = Config.Bind("General", "Activation Mode", Mode.Continuous, """
+            Toggle: Press once to activate; press again to hide the indicator.
+            Fade Away: Activates every time the button is pressed. The indicator will fade away after 3 seconds. Credit to VicVoss on GitHub for the idea.
+            Trigger: Activates every time the button is pressed. The indicator will remain visible.
+            Continuous: Always active. The indicator will remain visible, and updates as you move. Implemented by cjmanca on GitHub.
+            """);
+
         configStandableBallColor = Config.Bind("Appearance", "Standable ground Color", StandableColor.White, "Change the ball color of standable ground.");
         configNonStandableBallColor = Config.Bind("Appearance", "Non-standable ground Color", NonStandableColor.Red, "Change the ball color of non-standable ground.");
         configAlpha = Config.Bind("Appearance", "Transparency Percent", 100f, new ConfigDescription("How transparent the balls are.", new AcceptableValueRange<float>(1f, 100f)));
@@ -100,16 +111,11 @@ public class Plugin : BaseUnityPlugin
 
         configXZFreq = Config.Bind("General", "Horizontal grid spacing", 0.5f, new ConfigDescription("How far apart the balls are placed horizontally. Reducing will affect performance.", new AcceptableValueRange<float>(0.1f, 2f)));
 
-        configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 100, new ConfigDescription("The maximum number of points to place per frame. Higher values reduce fps but make the visualization appear faster.", new AcceptableValueRange<int>(10, 20000)));
+        configMaximumPointsPerFrame = Config.Bind("General", "Maximum points per frame", 1000, new ConfigDescription("The maximum number of raycasts to do per frame to check for standing spots. Higher values reduce fps but make the visualization appear faster.", new AcceptableValueRange<int>(10, 20000)));
+
+        configDetectConcave = Config.Bind("General", "Detect Concave Points", true, "Detecting standing spots on concave meshes takes many extra raycasts. Disabling won't show these standing spots, but will improve performance. Remember to increase 'Maximum points per frame' by about 10x if you enable this (1000+ at least - New default assumes this is enabled).");
 
         configActivationKey = Config.Bind("General", "Activation Key", KeyCode.F);
-
-        configMode = Config.Bind("General", "Activation Mode", Mode.Continuous, """
-            Toggle: Press once to activate; press again to hide the indicator.
-            Fade Away: Activates every time the button is pressed. The indicator will fade away after 3 seconds. Credit to VicVoss on GitHub for the idea.
-            Trigger: Activates every time the button is pressed. The indicator will remain visible.
-            Continuous: Always active. The indicator will remain visible, and updates as you move. Implemented by cjmanca on GitHub.
-            """);
         configDebugMode = Config.Bind("Debug", "Debug Mode", false, "Show debug information");
 
         string bundlePath = System.IO.Path.Combine(Paths.PluginPath, "Tzebruh-Foothold/Foothold");
@@ -207,6 +213,10 @@ public class Plugin : BaseUnityPlugin
         configXZFreq.SettingChanged += Color_SettingChanged;
         configMaximumPointsPerFrame.SettingChanged += Color_SettingChanged;
         configScalePercent.SettingChanged += Color_SettingChanged;
+        configDetectConcave.SettingChanged += Color_SettingChanged;
+        configAlpha.SettingChanged += Color_SettingChanged;
+
+
 
 
         standableMatrices.Add(new Matrix4x4[500]);
@@ -250,6 +260,8 @@ public class Plugin : BaseUnityPlugin
             scalePercent = configScalePercent.Value / 100f;
             scale = Vector3.one / 10 * scalePercent;
             baseAlpha = configAlpha.Value / 100f;
+            detectConcave = configDetectConcave.Value;
+
 
 
             if (configStandableBallColor.Value == StandableColor.Green)
@@ -349,12 +361,12 @@ public class Plugin : BaseUnityPlugin
         GUILayout.Label("highestBallCount: " + highestBallCount);
         GUILayout.Label("positionCache (x/z count): " + positionCache.Count);
 
-
         GUILayout.Label("positionCache (total y count): " + count);
         GUILayout.Label("positionCache (highest total y count): " + highestCount);
         GUILayout.Label("positionCache (allocations): " + PositionKey.totalAllocations);
         GUILayout.Label("positionCache (totalInUse): " + PositionKey.totalInUse);
         GUILayout.Label("positionCache (leaks): " + (PositionKey.totalAllocations - (PositionKey.PoolCount + count)));
+        GUILayout.Label("Total Raycasts Last Render: " + overallTotalCallsLastRender);
 
         GUILayout.Label("alpha: " + alpha);
         GUILayout.Label("isVisualizationRunning: " + isVisualizationRunning.ToString());
@@ -398,6 +410,7 @@ public class Plugin : BaseUnityPlugin
         scalePercent = configScalePercent.Value / 100f;
         scale = Vector3.one / 10 * scalePercent;
         baseAlpha = configAlpha.Value / 100f;
+        detectConcave = configDetectConcave.Value;
 
 
         nearestGridToCamera.x = 0;
@@ -475,17 +488,45 @@ public class Plugin : BaseUnityPlugin
                 }
             }
 
+            CheckHotkeys();
+            if (configMode.Value == Mode.FadeAway) SetBallAlphas();
+
             if (configMode.Value == Mode.Continuous)
             {
+                if (continuousPauseToggleQueued && !isVisualizationRunning)
+                {
+                    continuousPauseToggleQueued = false;
+                    continuousPaused = !continuousPaused;
+
+                    /*
+
+                    if (continuousPaused)
+                    {
+                        ReturnAllBallsToPool();
+                    }
+                    else
+                    {
+                        // reset last camera to force full redraw
+                        nearestGridToCamera.x = 0;
+                        nearestGridToCamera.y = 0;
+                        nearestGridToCamera.z = 0;
+                    }
+                    */
+
+                    // just abuse the gem message for now to indicate if we're paused or not for testing purposes
+                    if (GlobalEvents.OnGemActivated != null)
+                    {
+                        GlobalEvents.OnGemActivated(!continuousPaused);
+                    }
+                }
+
                 if (!isVisualizationRunning && !continuousPaused)
                 {
+
                     isVisualizationRunning = true;
                     StartCoroutine(RenderChangedVisualizationCoroutine());
                 }
             }
-
-            CheckHotkeys();
-            if (configMode.Value == Mode.FadeAway) SetBallAlphas();
 
             try
             {
@@ -522,33 +563,13 @@ public class Plugin : BaseUnityPlugin
     {
         if (Input.GetKeyDown(configActivationKey.Value))
         {
-            if (isVisualizationRunning) return;
             if (configMode.Value == Mode.Continuous)
             {
-                continuousPaused = !continuousPaused;
-
-                /*
-
-                if (continuousPaused)
-                {
-                    ReturnAllBallsToPool();
-                }
-                else
-                {
-                    // reset last camera to force full redraw
-                    nearestGridToCamera.x = 0;
-                    nearestGridToCamera.y = 0;
-                    nearestGridToCamera.z = 0;
-                }
-                */
-
-                // just abuse the gem message for now to indicate if we're paused or not for testing purposes
-                if (GlobalEvents.OnGemActivated != null)
-                {
-                    GlobalEvents.OnGemActivated(!continuousPaused);
-                }
+                continuousPauseToggleQueued = true;
                 return;
             }
+
+            if (isVisualizationRunning) return;
 
             if (configMode.Value == Mode.Trigger)
             {
@@ -738,11 +759,13 @@ public class Plugin : BaseUnityPlugin
     }
 
 
+    int overallTotalCallsLastRender = 0;
     private IEnumerator RenderChangedVisualizationCoroutine()
     {
         additionalDebugInfo = "";
         lastScanTime = Time.time;
         totalCalls = 0;
+        int overallTotalCalls = 0;
         
         var (prevMinX, prevMaxX, prevMinZ, prevMaxZ) = cameraFrustum.GetFrequencyQuantizedXZFrustumBounds(freq);
 
@@ -794,6 +817,7 @@ public class Plugin : BaseUnityPlugin
 
                     if (totalCalls >= maximumRaysPerFrame)
                     {
+                        overallTotalCalls += totalCalls;
                         totalCalls = 0;
                         yield return null;
                     }
@@ -809,6 +833,7 @@ public class Plugin : BaseUnityPlugin
 
                     if (totalCalls >= maximumRaysPerFrame)
                     {
+                        overallTotalCalls += totalCalls;
                         totalCalls = 0;
                         yield return null;
                     }
@@ -836,6 +861,7 @@ public class Plugin : BaseUnityPlugin
 
                     if (totalCalls >= maximumRaysPerFrame)
                     {
+                        overallTotalCalls += totalCalls;
                         totalCalls = 0;
                         yield return null;
                     }
@@ -865,6 +891,7 @@ public class Plugin : BaseUnityPlugin
 
                     if (totalCalls >= maximumRaysPerFrame)
                     {
+                        overallTotalCalls += totalCalls;
                         totalCalls = 0;
                         yield return null;
                     }
@@ -896,6 +923,7 @@ public class Plugin : BaseUnityPlugin
 
                     if (totalCalls >= maximumRaysPerFrame)
                     {
+                        overallTotalCalls += totalCalls;
                         totalCalls = 0;
                         yield return null;
                     }
@@ -911,12 +939,15 @@ public class Plugin : BaseUnityPlugin
 
                     if (totalCalls >= maximumRaysPerFrame)
                     {
+                        overallTotalCalls += totalCalls;
                         totalCalls = 0;
                         yield return null;
                     }
                 }
             }
         }
+
+        overallTotalCallsLastRender = overallTotalCalls;
 
         isVisualizationRunning = false;
     }
@@ -1107,6 +1138,91 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    private void DoRaycastRecursive(PositionYList pCache, Vector3 from, Vector3 to)
+    {
+        Vector3[] extraRaycastsNeeded = new Vector3[100];
+        int totalExtraRaycasts = 0;
+
+        int hitcount = Physics.RaycastNonAlloc(from, Vector3.down, _terrainHitBuffer, Vector3.Distance(from, to), HelperFunctions.GetMask(HelperFunctions.LayerType.TerrainMap), QueryTriggerInteraction.UseGlobal);
+
+        for (int i = 0; i < hitcount; i++)
+        {
+            totalCalls++;
+
+            RaycastHit raycastHit = _terrainHitBuffer[i];
+
+            if (!raycastHit.transform) continue;
+
+            if (raycastHit.point.y < 0.5f) continue; // ignore surfaces below sea level
+
+            CollisionModifier component = raycastHit.collider.GetComponent<CollisionModifier>();
+            if (component && !component.standable) continue;
+
+            if (detectConcave && totalExtraRaycasts < 100)
+            {
+                // detect if we need to do extra raycasts to fill in gaps due to concave surfaces
+                MeshCollider mc = raycastHit.collider as MeshCollider;
+                if (mc && !mc.convex)
+                {
+                    extraRaycastsNeeded[totalExtraRaycasts] = raycastHit.point;
+                    totalExtraRaycasts++;
+                }
+            }
+            
+            if (pCache.list.ContainsKey((int)Mathf.Round(raycastHit.point.y * 10f))) continue;
+
+            float angle = Vector3.Angle(Vector3.up, raycastHit.normal);
+
+            if (angle < 30f) continue; // don't need to show on flat ground
+
+            PositionKey positionKey = PositionKey.GetNew(
+                raycastHit.point.x,
+                raycastHit.point.y,
+                raycastHit.point.z,
+                angle < 50f
+            );
+            
+            pCache.list.Add((int)Mathf.Round(raycastHit.point.y * 10f), positionKey);
+        }
+
+        if (detectConcave)
+        {
+            // do extra raycasts for concave surfaces
+            for (int i = 0; i < totalExtraRaycasts; i++)
+            {
+                var line = extraRaycastsNeeded[i];
+
+                float closestY = to.y;
+                PositionKey closestPoint = null;
+
+                foreach (var position in pCache.list.Values)
+                {
+                    if (position != null)
+                    {
+                        // top down, so higher y is closer to start point
+                        if (position.position.y > closestY && position.position.y < line.y)
+                        {
+                            closestY = position.position.y;
+                            closestPoint = position;
+                        }
+                    }
+                }
+
+                if (closestPoint != null)
+                {
+                    Vector3 newFrom = line + Vector3.down * 0.5f;
+                    Vector3 newTo = closestPoint.position + Vector3.up * 0.1f;
+
+                    if (newTo.y >= newFrom.y) continue; // sanity check
+
+                    // start new raycast from just below the startpoint to just above the next point below it
+                    DoRaycastRecursive(pCache, newFrom, newTo);
+                    continue;
+                }
+            }
+        }
+    }
+
     private PositionYList CheckCacheMiss(int x, float y, int z)
     {
         PositionYList pCache = null;
@@ -1127,41 +1243,13 @@ public class Plugin : BaseUnityPlugin
             // Stop the line just before 0 y, since we don't need to be visualizing the shallow water floor
             // Remember that x/z are increased in magnitude for index purposes
             Vector3 from = new Vector3(x/10f, y + range * 1.5f, z/10f);
-
-            int hitcount = Physics.RaycastNonAlloc(from, Vector3.down, _terrainHitBuffer, range * 3f, HelperFunctions.GetMask(HelperFunctions.LayerType.TerrainMap), QueryTriggerInteraction.UseGlobal);
+            Vector3 to = from + Vector3.down * range * 3f;
 
             pCache.rayTop = from.y;
-            pCache.rayBottom = from.y - range * 3f;
+            pCache.rayBottom = to.y;
 
-            for (int i = 0; i < hitcount; i++)
-            {
-                totalCalls++;
+            DoRaycastRecursive(pCache, from, to);
 
-                RaycastHit raycastHit = _terrainHitBuffer[i];
-
-                if (!raycastHit.transform) continue;
-
-                if (raycastHit.point.y < 0.5f) continue; // ignore surfaces below sea level
-
-                CollisionModifier component = raycastHit.collider.GetComponent<CollisionModifier>();
-                if (component && !component.standable) continue;
-
-                float angle = Vector3.Angle(Vector3.up, raycastHit.normal);
-
-                if (angle < 30f) continue; // don't need to show on flat ground
-
-                if (pCache.list.ContainsKey((int)Mathf.Round(raycastHit.point.y * 10f))) continue;
-
-                PositionKey positionKey = PositionKey.GetNew(
-                    raycastHit.point.x,
-                    raycastHit.point.y,
-                    raycastHit.point.z,
-                    angle < 50f
-                );
-                
-                pCache.list.Add((int)Mathf.Round(raycastHit.point.y * 10f), positionKey);
-            }
-            
             positionCache[(x, z)] = pCache;
         }
         return pCache;
@@ -1416,6 +1504,8 @@ public class Plugin : BaseUnityPlugin
         float XPrepY = 0f;
         float XZPrepY = 0f;
 
+        float XPrepDistance = 0f;
+        float XZPrepDistance = 0f;
 
         public void PrepX(float x)
         {
@@ -1423,34 +1513,44 @@ public class Plugin : BaseUnityPlugin
             XPrepZ = x * forward.x;
             XPrepX = x * right.x;
             XPrepY = x * up.x;
+
+            XPrepDistance = x * x;
         }
 
         public void PrepXZ(float z)
         {
             z = z - camPos.z;
-            XZPrepZ = XPrepZ + z * forward.z;
-            XZPrepX = XPrepX + z * right.z;
-            XZPrepY = XPrepY + z * up.z;
+            XZPrepZ = XPrepZ + (z * forward.z);
+            XZPrepX = XPrepX + (z * right.z);
+            XZPrepY = XPrepY + (z * up.z);
+
+            XZPrepDistance = XPrepDistance + (z * z);
         }
 
         public bool PreppedYContains(float pointY)
         {
             pointY = pointY - camPos.y;
 
-            // Distance along camera forward
-            float z = XZPrepZ + pointY * forward.y;
+            // Approximate distance along camera forward. The edges of the camera will show further than the center, but faster
+            // We need z for other calcs anyway, so may as well use it to short circuit before doing the true distance check later.
+            float z = XZPrepZ + (pointY * forward.y);
             if (z < near || z > far)
                 return false;
-
+            
             // Offsets in camera's right / up directions
-            float x = XZPrepX + pointY * right.y;
+            float x = XZPrepX + (pointY * right.y);
             float maxX = z * tanHalfHorFov;
             if (Mathf.Abs(x) > maxX) return false;
 
-            float y = XZPrepY + pointY * up.y;
+            float y = XZPrepY + (pointY * up.y);
             float maxY = z * tanHalfVertFov;
 
             if (Mathf.Abs(y) > maxY) return false;
+
+            // True pythagoras distance from camera
+            float distSqr = XZPrepDistance + (pointY * pointY);
+            if (distSqr < near * near || distSqr > far * far)
+                return false;
 
             return true;
         }
@@ -1474,6 +1574,11 @@ public class Plugin : BaseUnityPlugin
             float maxY = z * tanHalfVertFov;
 
             if (Mathf.Abs(y) > maxY) return false;
+
+            // True pythagoras distance from camera
+            float distSqr = v.sqrMagnitude;
+            if (distSqr < near * near || distSqr > far * far)
+                return false;
 
             return true;
         }
