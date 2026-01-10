@@ -5,7 +5,9 @@ using JetBrains.Annotations;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Security.Cryptography.X509Certificates;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -118,15 +120,43 @@ public class Plugin : BaseUnityPlugin
         configActivationKey = Config.Bind("General", "Activation Key", KeyCode.F);
         configDebugMode = Config.Bind("Debug", "Debug Mode", false, "Show debug information");
 
-        string bundlePath = System.IO.Path.Combine(Paths.PluginPath, "Tzebruh-Foothold/Foothold");
-        var bundle = AssetBundle.LoadFromFile(bundlePath);
-        if (bundle == null)
+        string assemblyFolder = Path.GetDirectoryName(new System.Uri(System.Reflection.Assembly.GetExecutingAssembly().CodeBase).LocalPath);
+        string[] possibleAssetbundlePaths = new string[]
         {
-            Logger.LogError("Failed to load AssetBundle");
+            Path.Combine(assemblyFolder, "Foothold.assetbundle"),
+            Path.Combine(assemblyFolder, "Foothold.bundle"),
+            Path.Combine(assemblyFolder, "Foothold.unity3d"),
+            Path.Combine(assemblyFolder, "assets", "Foothold.assetbundle"),
+            Path.Combine(assemblyFolder, "assets", "Foothold.bundle"),
+            Path.Combine(assemblyFolder, "assets", "Foothold.unity3d"),
+            Path.Combine(assemblyFolder, "Foothold"),
+            Path.Combine(assemblyFolder, "assets", "Foothold"),
+        };
+
+        AssetBundle bundle = null;
+        string bundlePath = null;
+
+        foreach (var path in possibleAssetbundlePaths)
+        {
+            if (File.Exists(path))
+            {
+                bundlePath = path;
+                break;
+            }
+        }
+        if (bundlePath == null)
+        {
+            Logger.LogError("Failed to load AssetBundle (not found)");
             return;
         }
 
-        // Adjust the asset name to whatever you used
+        bundle = AssetBundle.LoadFromFile(bundlePath);
+        if (bundle == null)
+        {
+            Logger.LogError("Failed to load AssetBundle (failed to load from file)");
+            return;
+        }
+
         Material _instancedMat = bundle.LoadAsset<Material>("Foothold");
         if (_instancedMat == null)
         {
@@ -138,19 +168,14 @@ public class Plugin : BaseUnityPlugin
             Logger.LogInfo("Loaded instanced material: " + _instancedMat.name);
         }
 
-        // Try disabling SRP Batcher to see if that frees up instancing.
-        //GraphicsSettings.useScriptableRenderPipelineBatching = false;
-        //Logger.LogInfo("SRP Batcher disabled by mod");
-
 
         ballMesh = Resources.GetBuiltinResource<Mesh>("Sphere.fbx");
 
         Logger.LogInfo($"mesh = {ballMesh}");
 
-        //Material mat = new(Shader.Find("Universal Render Pipeline/Lit Instanced"));
+
         Material mat = new(_instancedMat);
         // permanently borrowed from https://discussions.unity.com/t/how-to-make-a-urp-lit-material-semi-transparent-using-script-and-then-set-it-back-to-being-solid/942231/3
-        
         mat.SetFloat("_Surface", 1);
         mat.SetFloat("_Blend", 0);
         mat.SetInt("_IgnoreProjector", 1);           // Ignore projectors (like rain)
@@ -169,7 +194,7 @@ public class Plugin : BaseUnityPlugin
 
         mat.color = c;
         mat.SetColor("_BaseColor", c);
-        /**/
+        
         mat.enableInstancing = true;
         standableMaterial = mat;
 
@@ -192,7 +217,7 @@ public class Plugin : BaseUnityPlugin
 
         mat.color = c;
         mat.SetColor("_BaseColor", c);
-        /**/
+        
         mat.enableInstancing = true;
         nonStandableMaterial = mat;
 
